@@ -1,0 +1,130 @@
+#include "RTEffect/EffectSummary.h"
+#include "RTEffect/Passes.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
+#include "llvm/Support/raw_ostream.h"
+#include <set>
+#include <string>
+
+using namespace llvm;
+
+#define DEBUG_TYPE "rt-san-place"
+
+namespace {
+
+bool hasAnnotation(Function &F, StringRef Annotation) {
+  GlobalVariable *GA = F.getParent()->getNamedGlobal("llvm.global.annotations");
+  if (!GA)
+    return false;
+
+  if (auto *CA = dyn_cast<ConstantArray>(GA->getInitializer())) {
+    for (unsigned i = 0; i < CA->getNumOperands(); ++i) {
+      if (auto *CS = dyn_cast<ConstantStruct>(CA->getOperand(i))) {
+        if (CS->getNumOperands() >= 2) {
+          if (auto *Val = dyn_cast<Constant>(
+                  CS->getOperand(0)->stripPointerCasts())) {
+            if (Val->stripPointerCasts() == &F) {
+              Value *AnnPtr = CS->getOperand(1)->stripPointerCasts();
+              if (auto *GV = dyn_cast<GlobalVariable>(AnnPtr)) {
+                if (auto *CDA = dyn_cast<ConstantDataArray>(GV->getInitializer())) {
+                  if (CDA->getAsString().contains(Annotation))
+                    return true;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+bool hasConstraint(Function &F, const char *Constraint) {
+  if (F.hasFnAttribute(Constraint))
+    return true;
+
+  return hasAnnotation(F, Constraint);
+}
+
+bool isRTFunction(Function &F) {
+  return hasConstraint(F, "nonblocking") ||
+         hasConstraint(F, "nonallocating") ||
+         hasConstraint(F, "rt_nonblocking") ||
+         hasConstraint(F, "rt_nonallocating");
+}
+
+} // namespace
+
+PreservedAnalyses RTSanPlacementPass::run(Module &M,
+                                          ModuleAnalysisManager &AM) {
+  errs() << "[RTSanPlacementPass] Placing RTSan instrumentation"
+         << (InstrumentAll ? " (instrument-all mode)" : " (selective mode)")
+         << "...\n";
+
+  LLVMContext &Ctx = M.getContext();
+  FunctionType *HookTy =
+      FunctionType::get(Type::getVoidTy(Ctx), {PointerType::getUnqual(Ctx)}, false);
+
+  FunctionCallee EnterHook =
+      M.getOrInsertFunction("__rtsan_realtime_enter", HookTy);
+  FunctionCallee ExitHook =
+      M.getOrInsertFunction("__rtsan_realtime_exit", HookTy);
+
+  int Instrumented = 0;
+  int Skipped = 0;
+
+  for (auto &F : M) {
+    if (F.isDeclaration() || F.empty())
+      continue;
+
+    bool IsRT = isRTFunction(F);
+
+    if (!InstrumentAll && !IsRT) {
+      Skipped++;
+      continue;
+    }
+
+    FunctionEffectSummary Summary = FunctionEffectSummary::readFromMetadata(F);
+
+    if (!InstrumentAll) {
+      if (IsRT && Summary.status == FunctionEffectSummary::ProvenSafe) {
+        errs() << "  Skipping (ProvenSafe RT): " << F.getName() << "\n";
+        Skipped++;
+        continue;
+      }
+    }
+
+    errs() << "  Instrumenting: " << F.getName()
+           << " [status=" << (int)Summary.status;
+    if (IsRT)
+      errs() << ", RT";
+    errs() << "]\n";
+
+    BasicBlock &EntryBB = F.getEntryBlock();
+    IRBuilder<> Builder(&EntryBB, EntryBB.getFirstInsertionPt());
+
+    Value *FuncName = Builder.CreateGlobalStringPtr(F.getName());
+
+    Builder.CreateCall(EnterHook, {FuncName});
+
+    for (auto &BB : F) {
+      if (ReturnInst *RI = dyn_cast<ReturnInst>(BB.getTerminator())) {
+        IRBuilder<> RetBuilder(RI);
+        RetBuilder.CreateCall(
+            ExitHook, {RetBuilder.CreateGlobalStringPtr(F.getName())});
+      }
+    }
+
+    Instrumented++;
+  }
+
+  errs() << "[RTSanPlacementPass] Instrumented " << Instrumented
+         << " functions, skipped " << Skipped << "\n";
+
+  return PreservedAnalyses::none();
+}
