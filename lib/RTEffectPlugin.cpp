@@ -1,6 +1,10 @@
 #include "RTEffect/Passes.h"
 #include "llvm/Passes/PassBuilder.h"
+#if __has_include("llvm/Passes/PassPlugin.h")
 #include "llvm/Passes/PassPlugin.h"
+#else
+#include "llvm/Plugins/PassPlugin.h"
+#endif
 
 using namespace llvm;
 
