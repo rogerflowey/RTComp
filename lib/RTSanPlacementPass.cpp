@@ -10,7 +10,6 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/Support/raw_ostream.h"
 #include <vector>
-#include <string>
 
 using namespace llvm;
 
@@ -70,29 +69,6 @@ void markNoSanitizeRealtime(Function &F) {
   F.setMetadata("nosanitize_realtime", MDNode::get(Ctx, {}));
 }
 
-Value *getFunctionNamePtr(Function &F, Module &M) {
-  LLVMContext &Ctx = M.getContext();
-  std::string GlobalName = "__rtsan_func_name." + F.getName().str();
-  auto MakePtr = [&](GlobalVariable *GV) -> Constant * {
-    SmallVector<Constant *, 2> Indices = {
-        ConstantInt::get(Type::getInt32Ty(Ctx), 0),
-        ConstantInt::get(Type::getInt32Ty(Ctx), 0)};
-    return ConstantExpr::getInBoundsGetElementPtr(
-        GV->getValueType(), GV, Indices);
-  };
-
-  if (auto *GV = M.getNamedGlobal(GlobalName))
-    return MakePtr(GV);
-
-  Constant *NameConst = ConstantDataArray::getString(Ctx, F.getName(), true);
-  auto *GV = new GlobalVariable(M, NameConst->getType(), true,
-                                GlobalValue::PrivateLinkage, NameConst,
-                                GlobalName);
-  GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
-  GV->setAlignment(Align(1));
-  return MakePtr(GV);
-}
-
 bool isFunctionExitTerminator(Instruction *Term) {
   return isa<ReturnInst>(Term) || isa<ResumeInst>(Term) ||
          isa<CleanupReturnInst>(Term) || isa<CatchReturnInst>(Term);
@@ -108,7 +84,7 @@ PreservedAnalyses RTSanPlacementPass::run(Module &M,
 
   LLVMContext &Ctx = M.getContext();
   FunctionType *HookTy =
-      FunctionType::get(Type::getVoidTy(Ctx), {PointerType::getUnqual(Ctx)}, false);
+      FunctionType::get(Type::getVoidTy(Ctx), false);
 
   FunctionCallee EnterHook =
       M.getOrInsertFunction("__rtsan_realtime_enter", HookTy);
@@ -153,9 +129,7 @@ PreservedAnalyses RTSanPlacementPass::run(Module &M,
     BasicBlock &EntryBB = F.getEntryBlock();
     IRBuilder<> Builder(&EntryBB, EntryBB.getFirstInsertionPt());
 
-    Value *FuncName = getFunctionNamePtr(F, M);
-
-    Builder.CreateCall(EnterHook, {FuncName});
+    Builder.CreateCall(EnterHook);
 
     std::vector<Instruction *> ExitTerms;
     for (auto &BB : F) {
@@ -166,7 +140,7 @@ PreservedAnalyses RTSanPlacementPass::run(Module &M,
 
     for (Instruction *Term : ExitTerms) {
       IRBuilder<> ExitBuilder(Term);
-      ExitBuilder.CreateCall(ExitHook, {FuncName});
+      ExitBuilder.CreateCall(ExitHook);
     }
 
     Instrumented++;

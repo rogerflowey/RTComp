@@ -97,6 +97,26 @@ Inserts `__rtsan_realtime_enter` / `__rtsan_realtime_exit` hooks:
 Exit hooks are inserted before normal returns and unwind exits such as `resume`,
 `cleanupret`, and `catchret`.
 
+The inserted hooks use the real compiler-rt RTSan ABI:
+
+```llvm
+declare void @__rtsan_realtime_enter()
+declare void @__rtsan_realtime_exit()
+```
+
+To use the real RTSan runtime, compile/link the instrumented IR with Clang's
+RTSan runtime enabled:
+
+```bash
+clang++ -O2 -g -c build/app.rtsan.ll -o build/app.rtsan.o
+clang++ -O2 -g -fsanitize=realtime build/app.rtsan.o -o build/app.rtsan
+```
+
+For the selective pipeline, do not compile the original source files with
+`-fsanitize=realtime`, because Clang will insert its own hooks before this pass
+can decide which RT functions are proven safe. Use `-fsanitize=realtime` at the
+final link/compile-from-instrumented-IR step to pull in compiler-rt RTSan.
+
 ### Instrument-All Baseline
 
 ```bash
@@ -132,16 +152,20 @@ functions.
 
 ## RTSan Shim
 
-`rtsan_runtime/rtsan_shim.c` provides standalone hook definitions for tests and
-experiments:
+`rtsan_runtime/rtsan_shim.c` is not a replacement for compiler-rt RTSan. It
+provides standalone hook definitions for tests and hook-count experiments when
+the real runtime is not linked:
 
 ```c
-void __rtsan_realtime_enter(const char *func_name);
-void __rtsan_realtime_exit(const char *func_name);
+void __rtsan_realtime_enter(void);
+void __rtsan_realtime_exit(void);
 uint64_t __rtsan_realtime_enter_count(void);
 uint64_t __rtsan_realtime_exit_count(void);
 void __rtsan_realtime_reset_counts(void);
 ```
+
+Do not link the shim and `-fsanitize=realtime` into the same binary; both define
+the RTSan entry/exit hooks.
 
 ## Architecture
 

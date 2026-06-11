@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin_dir/libRTEffect.so -passes="rt-effect-infer,rt-san-place-all" -S %s -o /dev/null 2>&1 | %FileCheck %s
+; RUN: %opt -load-pass-plugin=%plugin_dir/libRTEffect.so -passes="rt-effect-infer,rt-san-place-all" -S %s -o - 2>&1 | %FileCheck %s
 
 declare ptr @malloc(i64)
 
@@ -24,3 +24,4 @@ attributes #1 = { "nonallocating" }
 ; CHECK: Instrumenting: rt_unsafe
 ; CHECK-NOT: Instrumenting: plain_func
 ; CHECK: Instrumented 2
+; CHECK: declare void @__rtsan_realtime_enter()
