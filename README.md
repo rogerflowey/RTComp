@@ -24,6 +24,41 @@ cmake --build build -j$(nproc)
 
 This produces `build/libRTEffect.so`.
 
+## One-Command Runner
+
+`scripts/run_rt_effect.sh` builds the plugin, compiles an input to LLVM IR when
+needed, runs the RT-Effect pass pipeline, writes JSON diagnostics, and can link
+the result with either the real compiler-rt RTSan runtime or the local counting
+shim.
+
+Run the built-in smoke example:
+
+```bash
+scripts/run_rt_effect.sh
+```
+
+Check a source file and emit diagnostics:
+
+```bash
+scripts/run_rt_effect.sh --mode check test/Inputs/rt_helper_chain.c
+```
+
+Run selective placement and link with real RTSan:
+
+```bash
+scripts/run_rt_effect.sh --mode selective --real-rtsan path/to/program.cpp
+```
+
+Run the instrument-all baseline with the local counting shim:
+
+```bash
+scripts/run_rt_effect.sh --mode all --shim path/to/program.c
+```
+
+Inputs may be `.c`, `.cc`, `.cpp`, `.cxx`, `.ll`, or `.bc`. Linking modes
+require the input module to define `main`. Generated files are written under
+`build/rt-effect-run` by default.
+
 ## Usage
 
 The plugin registers three passes in the LLVM new pass manager pipeline:
@@ -239,6 +274,8 @@ rtcomp/
 │   ├── RTConstraintCheckPass.cpp # Constraint checking + diagnostics
 │   ├── RTSanPlacementPass.cpp  # Selective RTSan instrumentation
 │   └── RTEffectPlugin.cpp      # Pass plugin registration entry point
+├── scripts/
+│   └── run_rt_effect.sh        # Build/run helper for analysis and RTSan modes
 ├── rtsan_runtime/
 │   └── rtsan_shim.c            # Minimal RTSan-compatible runtime hooks
 ├── test/
