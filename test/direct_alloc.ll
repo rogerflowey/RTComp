@@ -1,7 +1,7 @@
 ; RUN: %opt -load-pass-plugin=%plugin_dir/libRTEffect.so -passes="rt-effect-infer" -S %s -o /dev/null 2>&1 | %FileCheck %s
 
-; CHECK: may_block=0 may_alloc=1 unknown=0 [via malloc]
-; CHECK: [via _Znwm]
+; CHECK: direct_malloc: may_block=0 may_alloc=1{{.*}}[via malloc]
+; CHECK: direct_new: may_block=0 may_alloc=1{{.*}}[via _Znwm]
 
 declare ptr @malloc(i64)
 declare ptr @_Znwm(i64)
@@ -27,4 +27,4 @@ define void @safe_arithmetic(i32 %x) {
   %y = add i32 %x, 1
   ret void
 }
-; CHECK: safe_arithmetic: may_block=0 may_alloc=0
+; CHECK: safe_arithmetic: may_block=0 may_alloc=0{{.*}}may_throw=0{{.*}}may_lock=0

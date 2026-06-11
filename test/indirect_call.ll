@@ -9,7 +9,7 @@ define void @indirect_call() {
   call void %fp()
   ret void
 }
-; CHECK: indirect_call: may_block=0 may_alloc=0 unknown=1
+; CHECK: indirect_call: may_block=0 may_alloc=0{{.*}}unknown=1
 ; CHECK: unknown via <indirect call>
 
 define void @unknown_external() {
@@ -17,5 +17,5 @@ define void @unknown_external() {
   ret void
 }
 declare void @some_unknown_library_function()
-; CHECK: unknown_external: may_block=0 may_alloc=0 unknown=1
+; CHECK: unknown_external: may_block=0 may_alloc=0{{.*}}unknown=1
 ; CHECK: unknown via some_unknown_library_function

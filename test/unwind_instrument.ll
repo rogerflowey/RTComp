@@ -19,7 +19,7 @@ lpad:
 
 attributes #0 = { "nonblocking" }
 
-; CHECK: Instrumenting: rt_unwind
+; CHECK: Instrumenting (whole): rt_unwind
 ; CHECK-LABEL: define void @rt_unwind
 ; CHECK: call void @__rtsan_realtime_enter
 ; CHECK: ok:

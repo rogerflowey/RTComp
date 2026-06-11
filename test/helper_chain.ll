@@ -40,5 +40,5 @@ define void @mixed_outer(ptr %m) {
 }
 
 ; CHECK: outer_alloc: may_block=0 may_alloc=1
-; CHECK: outer_lock: may_block=1 may_alloc=0
-; CHECK: mixed_outer: may_block=1 may_alloc=1
+; CHECK: outer_lock: may_block=1 may_alloc=0{{.*}}may_lock=1
+; CHECK: mixed_outer: may_block=1 may_alloc=1{{.*}}may_lock=1

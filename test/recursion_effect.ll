@@ -15,7 +15,7 @@ recurse:
 done:
   ret void
 }
-; CHECK: recurse_alloc: may_block=0 may_alloc=1 unknown=0 [via <recursive-scc> -> malloc]
+; CHECK: recurse_alloc: may_block=0 may_alloc=1{{.*}}may_recurse=1{{.*}}[via <recursive-scc> -> malloc]
 
 define void @mutual_a(i32 %n) {
   %cmp = icmp eq i32 %n, 0
@@ -34,5 +34,5 @@ define void @mutual_b(i32 %n) {
   call void @mutual_a(i32 %next)
   ret void
 }
-; CHECK: mutual_a: may_block=0 may_alloc=1
-; CHECK: mutual_b: may_block=0 may_alloc=1
+; CHECK: mutual_a: may_block=0 may_alloc=1{{.*}}may_recurse=1
+; CHECK: mutual_b: may_block=0 may_alloc=1{{.*}}may_recurse=1

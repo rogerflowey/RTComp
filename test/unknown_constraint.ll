@@ -17,8 +17,8 @@ declare void @some_unknown_library_function()
 
 attributes #0 = { "nonblocking" }
 
-; CHECK: rt_indirect: may_block=0 may_alloc=0 unknown=1
-; CHECK: rt_unknown_external: may_block=0 may_alloc=0 unknown=1
+; CHECK: rt_indirect: may_block=0 may_alloc=0{{.*}}unknown=1
+; CHECK: rt_unknown_external: may_block=0 may_alloc=0{{.*}}unknown=1
 ; CHECK: [RT-FEA] nonblocking Unknown violation in rt_indirect: unknown-call via <indirect call>
 ; CHECK: #0 rt_indirect -> <indirect call> [indirect-call]
 ; CHECK: suggestion: Add the callee to external_funcs.yaml

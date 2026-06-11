@@ -14,7 +14,7 @@ define void @rt_unsafe() #1 {
   ret void
 }
 attributes #1 = { "nonallocating" }
-; CHECK: Instrumenting: rt_unsafe
+; CHECK: Instrumenting (per-callsite x1): rt_unsafe
 ; CHECK: define void @rt_safe() {{.*}}!nosanitize_realtime
 ; CHECK: call void @__rtsan_realtime_enter()
 ; CHECK: call void @__rtsan_realtime_exit()
@@ -24,4 +24,4 @@ define void @plain_func() {
   %p = call ptr @malloc(i64 16)
   ret void
 }
-; CHECK-NOT: Instrumenting: plain_func
+; CHECK-NOT: Instrumenting{{.*}}plain_func
