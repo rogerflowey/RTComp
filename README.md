@@ -6,10 +6,21 @@ Realtime Function Effect Analysis and Selective RealtimeSanitizer Instrumentatio
 
 An out-of-tree LLVM pass plugin, currently tested with LLVM 22, that:
 
-1. **Infers** `may_block` / `may_alloc` / `unknown` effects on LLVM IR via inter-procedural fixpoint analysis
-2. **Tracks provenance** as call chains with instruction text and debug locations, stored in `!rt.effect`
-3. **Checks** real-time constraints on annotated functions, emitting text diagnostics and JSON Lines records
-4. **Guides** selective RTSan instrumentation: statically proven-safe RT functions skip hooks, while violating or unknown RT functions are instrumented
+1. **Infers** `may_block` / `may_alloc` / `may_throw` / `may_lock` / `may_recurse`
+   / `may_signal_unsafe` / `unknown` effects on LLVM IR via inter-procedural
+   fixpoint analysis, plus a bounded stack-depth via DAG longest-path.
+2. **Tracks provenance** as call chains with instruction text and debug locations,
+   stored in `!rt.effect`. Witness call instructions are tagged with `!rt.witness`.
+3. **Resolves indirect calls** when callee types match an address-taken function in
+   the module, and **infers effect-polymorphism** for callbacks that simply forward
+   one of their function-typed parameters.
+4. **Honors region scopes** (`__rt_region_enter` / `__rt_region_exit` markers) so an
+   RT-region within a larger function can be analysed in isolation.
+5. **Checks** real-time constraints on annotated functions, emitting text
+   diagnostics, JSON Lines records, and SARIF 2.1.0 reports.
+6. **Guides** selective RTSan instrumentation: statically proven-safe RT functions
+   skip hooks, while violating witnesses are wrapped per-call-site (or whole-function
+   when the witness is opaque).
 
 ## Build
 
@@ -96,9 +107,29 @@ prints the call chain, per-frame source location when `!dbg` is available, the
 leaf witness instruction, and a repair suggestion.
 
 Supported IR/function markers are:
-- `"nonblocking"` / `"nonallocating"` function attributes
-- `__attribute__((annotate("rt_nonblocking")))`
-- `__attribute__((annotate("rt_nonallocating")))`
+- `"nonblocking"` / `"nonallocating"` / `"nothrow"` / `"nolock"` /
+  `"norecurse"` / `"async_signal_safe"` function attributes
+- `"rt_stack_bound"="<N>"` function attribute (or `rt_stack_bound=<N>`
+  annotation) to require `MaxStackDepth <= N`
+- `__attribute__((annotate("rt_<constraint>")))` for the same names
+
+With the bundled Clang plugin (`build/libRTAttrPlugin.so`), C++ code can
+use the standard attribute syntax:
+
+```cpp
+[[rt::nonblocking]] void process();
+[[rt::nonallocating]] void update();
+[[rt::nothrow]] void notify();
+[[rt::nolock]] void poll();
+[[rt::norecurse]] void compute();
+[[rt::async_signal_safe]] void on_signal(int);
+__attribute__((rt_stack_bound(64))) void deep();
+```
+
+Load the plugin via `clang -fplugin=build/libRTAttrPlugin.so` (only the
+GNU spelling is available for `rt_stack_bound` because Clang's plugin
+infrastructure does not run the expression parser for C++11-attribute
+argument lists).
 
 Annotation fallback example:
 ```c
@@ -107,10 +138,14 @@ __attribute__((annotate("rt_nonallocating")))
 void my_rt_handler(void) { ... }
 ```
 
-Set `RTEFFECT_JSON_DIAGNOSTICS` to emit one JSON object per diagnostic:
+Set `RTEFFECT_JSON_DIAGNOSTICS` to emit one JSON object per diagnostic, or
+`RTEFFECT_SARIF_DIAGNOSTICS` to emit a single SARIF 2.1.0 run that can be
+uploaded to GitHub Code Scanning, opened in VS Code, or fed to any
+standard static-analysis pipeline:
 
 ```bash
 RTEFFECT_JSON_DIAGNOSTICS=diag.jsonl \
+RTEFFECT_SARIF_DIAGNOSTICS=diag.sarif \
 opt -load-pass-plugin=build/libRTEffect.so \
     -passes="rt-effect-infer,rt-constraint-check" \
     -disable-output input.ll
@@ -126,8 +161,15 @@ opt -load-pass-plugin=build/libRTEffect.so \
 
 Inserts `__rtsan_realtime_enter` / `__rtsan_realtime_exit` hooks:
 - **ProvenSafe** RT functions → **no hooks**, plus `!nosanitize_realtime`
-- **Violating** or **Unknown** RT functions → **hooks inserted**
+- **Violating** RT functions → **per-call-site hooks** around each
+  `!rt.witness` call; falls back to whole-function wrapping when no
+  local witness is available
+- **Unknown** RT functions → whole-function hooks (we cannot pinpoint
+  which call is problematic)
 - Non-RT functions → skipped
+
+Use `-passes="...,rt-san-place-whole"` to force the legacy whole-function
+behaviour for comparison.
 
 Exit hooks are inserted before normal returns and unwind exits such as `resume`,
 `cleanupret`, and `catchret`.
@@ -227,14 +269,22 @@ the RTSan entry/exit hooks.
 struct FunctionEffectSummary {
     bool MayBlock;
     bool MayAlloc;
+    bool MayThrow;
+    bool MayLock;
+    bool MayRecurse;
+    bool MaySignalUnsafe;
     bool HasUnknown;
+    int  MaxStackDepth;          // -1 = unbounded
+    bool IsEffectPolymorphic;
+    std::vector<unsigned> PolyArgs;
     enum Status { ProvenSafe=0, Violating=1, Unknown=2 } status;
-    std::string ReasonBlockFn;
-    std::string ReasonAllocFn;
-    std::string ReasonUnknown;
-    std::vector<RTProvenanceFrame> BlockChain;
-    std::vector<RTProvenanceFrame> AllocChain;
-    std::vector<RTProvenanceFrame> UnknownChain;
+    // Per-effect reason strings + provenance chains
+    std::string ReasonBlockFn, ReasonAllocFn, ReasonThrowFn,
+                ReasonLockFn,  ReasonRecurseFn, ReasonSignalUnsafeFn,
+                ReasonUnknown;
+    std::vector<RTProvenanceFrame> BlockChain, AllocChain,
+        ThrowChain, LockChain, RecurseChain, SignalUnsafeChain,
+        UnknownChain;
 };
 ```
 
@@ -270,17 +320,23 @@ rtcomp/
 ├── lib/
 │   ├── EffectSummary.cpp
 │   ├── ExternalFuncTable.cpp
-│   ├── RTEffectInferPass.cpp   # Effect inference (direct scan + fixpoint)
-│   ├── RTConstraintCheckPass.cpp # Constraint checking + diagnostics
-│   ├── RTSanPlacementPass.cpp  # Selective RTSan instrumentation
+│   ├── RTEffectInferPass.cpp   # Effect inference (direct + fixpoint + polymorphism)
+│   ├── RTConstraintCheckPass.cpp # Constraint checking, JSON + SARIF diagnostics
+│   ├── RTSanPlacementPass.cpp  # Selective per-call-site RTSan instrumentation
 │   └── RTEffectPlugin.cpp      # Pass plugin registration entry point
 ├── scripts/
 │   └── run_rt_effect.sh        # Build/run helper for analysis and RTSan modes
+├── clang_plugin/
+│   ├── RTAttrPlugin.cpp        # [[rt::*]] attribute plugin
+│   └── CMakeLists.txt
 ├── rtsan_runtime/
 │   └── rtsan_shim.c            # Minimal RTSan-compatible runtime hooks
-├── test/
-│   ├── lit.cfg                 # lit test runner configuration
-│   ├── *.ll                    # IR-level FileCheck tests
-│   └── Inputs/*.c              # Source-level end-to-end tests
-
+├── bench/                      # Hook-overhead benchmark harness
+│   ├── audio_dsp.cpp
+│   ├── run_benchmark.sh
+│   └── README.md
+└── test/
+    ├── lit.cfg                 # lit test runner configuration
+    ├── *.ll                    # IR-level FileCheck tests
+    └── Inputs/*.c              # Source-level end-to-end tests
 ```
