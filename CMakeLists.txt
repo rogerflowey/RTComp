@@ -47,3 +47,16 @@ else()
 
   target_link_libraries(RTEffect LLVM)
 endif()
+
+# The lit test harness references the plugin as `libRTEffect.so` on every
+# platform. Override the dylib suffix on Apple to keep tests portable.
+if(APPLE)
+  set_target_properties(RTEffect PROPERTIES SUFFIX ".so")
+endif()
+
+# Optional: build the [[rt::...]] Clang attribute plugin when the Clang
+# CMake package is discoverable.
+option(RTEFFECT_BUILD_CLANG_PLUGIN "Build the [[rt::]] Clang attribute plugin" ON)
+if(RTEFFECT_BUILD_CLANG_PLUGIN)
+  add_subdirectory(clang_plugin)
+endif()
