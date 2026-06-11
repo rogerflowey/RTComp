@@ -22,5 +22,5 @@ attributes #1 = { "nonallocating" }
 ; CHECK: instrument-all mode
 ; CHECK: Instrumenting: rt_safe
 ; CHECK: Instrumenting: rt_unsafe
-; CHECK: Instrumenting: plain_func
-; CHECK: Instrumented 3
+; CHECK-NOT: Instrumenting: plain_func
+; CHECK: Instrumented 2

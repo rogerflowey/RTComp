@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin_dir/libRTEffect.so -passes="rt-effect-infer,rt-constraint-check,rt-san-place" -S %s -o /dev/null 2>&1 | %FileCheck %s
+; RUN: %opt -load-pass-plugin=%plugin_dir/libRTEffect.so -passes="rt-effect-infer,rt-constraint-check,rt-san-place" -S %s -o - 2>&1 | %FileCheck %s
 
 declare ptr @malloc(i64)
 
@@ -15,6 +15,7 @@ define void @rt_unsafe() #1 {
 }
 attributes #1 = { "nonallocating" }
 ; CHECK: Instrumenting: rt_unsafe
+; CHECK: define void @rt_safe() {{.*}}!nosanitize_realtime
 
 define void @plain_func() {
   %p = call ptr @malloc(i64 16)

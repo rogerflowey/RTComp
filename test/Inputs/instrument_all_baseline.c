@@ -12,5 +12,5 @@ int normal_func(void) {
 }
 // CHECK: instrument-all mode
 // CHECK: Instrumenting: rt_func
-// CHECK: Instrumenting: normal_func
-// CHECK: Instrumented 2
+// CHECK-NOT: Instrumenting: normal_func
+// CHECK: Instrumented 1
