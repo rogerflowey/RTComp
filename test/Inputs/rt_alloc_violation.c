@@ -8,5 +8,5 @@ int rt_alloc_violation(int n) {
   int *p = (int *)malloc(n * sizeof(int));
   return p ? p[0] : -1;
 }
-// CHECK: VIOLATION in 'rt_alloc_violation'
+// CHECK: nonallocating direct violation in rt_alloc_violation
 // CHECK: malloc

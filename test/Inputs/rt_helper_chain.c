@@ -15,6 +15,6 @@ __attribute__((annotate("rt_nonallocating")))
 void rt_outer() {
   middle_alloc();
 }
-// CHECK: VIOLATION in 'rt_outer'
+// CHECK: nonallocating transitive violation in rt_outer
 // CHECK: inner_alloc
 // CHECK: malloc

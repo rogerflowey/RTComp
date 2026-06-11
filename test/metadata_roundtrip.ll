@@ -15,6 +15,8 @@ define void @rt_entry() #0 {
 attributes #0 = { "nonallocating" }
 
 ; CHECK: rt_entry: may_block=0 may_alloc=1 unknown=0 [via leaf_alloc -> malloc]
-; CHECK: VIOLATION in 'rt_entry'
+; CHECK: [RT-FEA] nonallocating transitive violation in rt_entry: may_alloc via leaf_alloc -> malloc
+; CHECK: #0 rt_entry -> leaf_alloc [call]
+; CHECK: #1 leaf_alloc -> malloc [external]
 ; CHECK: !rt.effect
 ; CHECK: leaf_alloc -> malloc

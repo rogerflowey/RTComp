@@ -7,5 +7,5 @@ __attribute__((annotate("rt_nonblocking")))
 void rt_block_violation(pthread_mutex_t *m) {
   pthread_mutex_lock(m);
 }
-// CHECK: VIOLATION in 'rt_block_violation'
-// CHECK: blocks
+// CHECK: nonblocking direct violation in rt_block_violation
+// CHECK: pthread_mutex_lock

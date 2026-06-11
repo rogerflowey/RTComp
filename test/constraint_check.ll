@@ -28,7 +28,11 @@ define void @rt_both_violation(ptr %m) #3 {
 }
 attributes #3 = { "nonblocking" "nonallocating" }
 
-; CHECK: SAFE: 'rt_safe_math'
-; CHECK: VIOLATION in 'rt_alloc_violation': allocates
-; CHECK: VIOLATION in 'rt_block_violation': blocks
-; CHECK: VIOLATION in 'rt_both_violation'
+; CHECK: [RT-FEA] SAFE: 'rt_safe_math'
+; CHECK: [RT-FEA] nonallocating direct violation in rt_alloc_violation: may_alloc via malloc
+; CHECK: #0 rt_alloc_violation -> malloc [external]
+; CHECK: suggestion: Preallocate memory
+; CHECK: [RT-FEA] nonblocking direct violation in rt_block_violation: may_block via pthread_mutex_lock
+; CHECK: #0 rt_block_violation -> pthread_mutex_lock [external]
+; CHECK: [RT-FEA] nonblocking direct violation in rt_both_violation
+; CHECK: [RT-FEA] nonallocating direct violation in rt_both_violation
