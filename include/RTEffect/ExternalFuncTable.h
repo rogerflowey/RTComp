@@ -11,6 +11,9 @@
 struct ExternalFuncInfo {
   bool MayBlock = false;
   bool MayAlloc = false;
+  bool MayThrow = false;
+  bool MayLock = false;
+  bool MaySignalUnsafe = false;
 };
 
 class ExternalFuncTable {

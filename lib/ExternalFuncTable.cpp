@@ -18,6 +18,9 @@ template <> struct MappingTraits<ExternalFuncInfo> {
   static void mapping(IO &io, ExternalFuncInfo &E) {
     io.mapOptional("may_block", E.MayBlock, false);
     io.mapOptional("may_alloc", E.MayAlloc, false);
+    io.mapOptional("may_throw", E.MayThrow, false);
+    io.mapOptional("may_lock", E.MayLock, false);
+    io.mapOptional("may_signal_unsafe", E.MaySignalUnsafe, false);
   }
 };
 
@@ -43,6 +46,9 @@ template <> struct MappingTraits<ExternalFuncYAMLEntry> {
     io.mapRequired("name", E.Name);
     io.mapOptional("may_block", E.Info.MayBlock, false);
     io.mapOptional("may_alloc", E.Info.MayAlloc, false);
+    io.mapOptional("may_throw", E.Info.MayThrow, false);
+    io.mapOptional("may_lock", E.Info.MayLock, false);
+    io.mapOptional("may_signal_unsafe", E.Info.MaySignalUnsafe, false);
   }
 };
 

@@ -37,18 +37,22 @@
 - name: pthread_mutex_lock
   may_block: true
   may_alloc: false
+  may_lock: true
 - name: pthread_mutex_trylock
   may_block: true
   may_alloc: false
+  may_lock: true
 - name: pthread_mutex_unlock
   may_block: false
   may_alloc: false
 - name: pthread_rwlock_rdlock
   may_block: true
   may_alloc: false
+  may_lock: true
 - name: pthread_rwlock_wrlock
   may_block: true
   may_alloc: false
+  may_lock: true
 - name: pthread_rwlock_unlock
   may_block: false
   may_alloc: false
@@ -223,12 +227,15 @@
 - name: sem_wait
   may_block: true
   may_alloc: false
+  may_lock: true
 - name: sem_trywait
   may_block: true
   may_alloc: false
+  may_lock: true
 - name: sem_timedwait
   may_block: true
   may_alloc: false
+  may_lock: true
 - name: sem_post
   may_block: false
   may_alloc: false
@@ -262,6 +269,37 @@
 - name: __cxa_allocate_exception
   may_block: false
   may_alloc: true
+  may_throw: true
 - name: __cxa_throw
   may_block: false
   may_alloc: true
+  may_throw: true
+- name: __cxa_rethrow
+  may_block: false
+  may_alloc: false
+  may_throw: true
+- name: _Unwind_RaiseException
+  may_block: false
+  may_alloc: false
+  may_throw: true
+- name: _Unwind_Resume
+  may_block: false
+  may_alloc: false
+  may_throw: true
+- name: longjmp
+  may_block: false
+  may_alloc: false
+  may_throw: true
+- name: siglongjmp
+  may_block: false
+  may_alloc: false
+  may_throw: true
+- name: malloc
+  may_signal_unsafe: true
+  may_alloc: true
+- name: printf
+  may_signal_unsafe: true
+  may_block: true
+- name: fprintf
+  may_signal_unsafe: true
+  may_block: true

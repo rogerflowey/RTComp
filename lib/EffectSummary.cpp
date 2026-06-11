@@ -14,6 +14,9 @@ const StringLiteral FunctionEffectSummary::MetadataName = "rt.effect";
 
 namespace {
 
+// Format token. Bump when on-disk layout changes incompatibly.
+const char *MetadataVersionTag = "rt.effect.v2";
+
 std::string escapeField(StringRef S) {
   std::string Out;
   for (char C : S) {
@@ -113,6 +116,30 @@ std::vector<RTProvenanceFrame> decodeChain(StringRef Encoded) {
   return Chain;
 }
 
+std::string encodePolyArgs(const std::vector<unsigned> &Args) {
+  std::string Out;
+  for (unsigned A : Args) {
+    if (!Out.empty())
+      Out += ",";
+    Out += std::to_string(A);
+  }
+  return Out;
+}
+
+std::vector<unsigned> decodePolyArgs(StringRef Encoded) {
+  std::vector<unsigned> Out;
+  SmallVector<StringRef, 4> Parts;
+  Encoded.split(Parts, ',');
+  for (StringRef P : Parts) {
+    if (P.empty())
+      continue;
+    unsigned V = 0;
+    if (!P.getAsInteger(10, V))
+      Out.push_back(V);
+  }
+  return Out;
+}
+
 std::string instructionToString(Instruction &I) {
   std::string Text;
   raw_string_ostream OS(Text);
@@ -122,6 +149,92 @@ std::string instructionToString(Instruction &I) {
 }
 
 } // namespace
+
+bool *FunctionEffectSummary::flagPtr(int K) {
+  switch (K) {
+  case RTE_Block: return &MayBlock;
+  case RTE_Alloc: return &MayAlloc;
+  case RTE_Throw: return &MayThrow;
+  case RTE_Lock: return &MayLock;
+  case RTE_Recurse: return &MayRecurse;
+  case RTE_SignalUnsafe: return &MaySignalUnsafe;
+  case RTE_Unknown: return &HasUnknown;
+  }
+  return nullptr;
+}
+
+const bool *FunctionEffectSummary::flagPtr(int K) const {
+  return const_cast<FunctionEffectSummary *>(this)->flagPtr(K);
+}
+
+std::string *FunctionEffectSummary::reasonPtr(int K) {
+  switch (K) {
+  case RTE_Block: return &ReasonBlockFn;
+  case RTE_Alloc: return &ReasonAllocFn;
+  case RTE_Throw: return &ReasonThrowFn;
+  case RTE_Lock: return &ReasonLockFn;
+  case RTE_Recurse: return &ReasonRecurseFn;
+  case RTE_SignalUnsafe: return &ReasonSignalUnsafeFn;
+  case RTE_Unknown: return &ReasonUnknown;
+  }
+  return nullptr;
+}
+
+const std::string *FunctionEffectSummary::reasonPtr(int K) const {
+  return const_cast<FunctionEffectSummary *>(this)->reasonPtr(K);
+}
+
+std::vector<RTProvenanceFrame> *FunctionEffectSummary::chainPtr(int K) {
+  switch (K) {
+  case RTE_Block: return &BlockChain;
+  case RTE_Alloc: return &AllocChain;
+  case RTE_Throw: return &ThrowChain;
+  case RTE_Lock: return &LockChain;
+  case RTE_Recurse: return &RecurseChain;
+  case RTE_SignalUnsafe: return &SignalUnsafeChain;
+  case RTE_Unknown: return &UnknownChain;
+  }
+  return nullptr;
+}
+
+const std::vector<RTProvenanceFrame> *
+FunctionEffectSummary::chainPtr(int K) const {
+  return const_cast<FunctionEffectSummary *>(this)->chainPtr(K);
+}
+
+const char *FunctionEffectSummary::kindName(int K) {
+  switch (K) {
+  case RTE_Block: return "may_block";
+  case RTE_Alloc: return "may_alloc";
+  case RTE_Throw: return "may_throw";
+  case RTE_Lock: return "may_lock";
+  case RTE_Recurse: return "may_recurse";
+  case RTE_SignalUnsafe: return "may_signal_unsafe";
+  case RTE_Unknown: return "unknown";
+  }
+  return "?";
+}
+
+void FunctionEffectSummary::merge(const FunctionEffectSummary &Other) {
+  for (int K = 0; K < RTE_Count; ++K) {
+    if (*Other.flagPtr(K) && !*flagPtr(K)) {
+      *flagPtr(K) = true;
+      *reasonPtr(K) = *Other.reasonPtr(K);
+      *chainPtr(K) = *Other.chainPtr(K);
+    }
+  }
+  if (Other.MaxStackDepth == -1)
+    MaxStackDepth = -1;
+  else if (MaxStackDepth != -1 && Other.MaxStackDepth > MaxStackDepth)
+    MaxStackDepth = Other.MaxStackDepth;
+}
+
+bool FunctionEffectSummary::hasAnyEffect() const {
+  for (int K = 0; K < RTE_Count; ++K)
+    if (*flagPtr(K))
+      return true;
+  return false;
+}
 
 RTProvenanceFrame FunctionEffectSummary::makeFrame(Function &F, Instruction &I,
                                                    StringRef CalleeName,
@@ -148,52 +261,61 @@ RTProvenanceFrame FunctionEffectSummary::makeFrame(Function &F, Instruction &I,
 void FunctionEffectSummary::writeToMetadata(Function &F,
                                             const FunctionEffectSummary &S) {
   LLVMContext &Ctx = F.getContext();
-  Metadata *Ops[] = {
-      ConstantAsMetadata::get(ConstantInt::getBool(Ctx, S.MayBlock)),
-      ConstantAsMetadata::get(ConstantInt::getBool(Ctx, S.MayAlloc)),
-      ConstantAsMetadata::get(
-          ConstantInt::get(Type::getInt32Ty(Ctx), static_cast<int>(S.status))),
-      MDString::get(Ctx, S.ReasonBlockFn),
-      MDString::get(Ctx, S.ReasonAllocFn),
-      ConstantAsMetadata::get(ConstantInt::getBool(Ctx, S.HasUnknown)),
-      MDString::get(Ctx, S.ReasonUnknown),
-      MDString::get(Ctx, encodeChain(S.BlockChain)),
-      MDString::get(Ctx, encodeChain(S.AllocChain)),
-      MDString::get(Ctx, encodeChain(S.UnknownChain)),
-  };
+  SmallVector<Metadata *, 32> Ops;
+
+  // Header: version tag, status, stack depth, polymorphism flag, poly arg list.
+  Ops.push_back(MDString::get(Ctx, MetadataVersionTag));
+  Ops.push_back(ConstantAsMetadata::get(
+      ConstantInt::get(Type::getInt32Ty(Ctx), static_cast<int>(S.status))));
+  Ops.push_back(ConstantAsMetadata::get(
+      ConstantInt::getSigned(Type::getInt32Ty(Ctx), S.MaxStackDepth)));
+  Ops.push_back(ConstantAsMetadata::get(
+      ConstantInt::getBool(Ctx, S.IsEffectPolymorphic)));
+  Ops.push_back(MDString::get(Ctx, encodePolyArgs(S.PolyArgs)));
+
+  // Per-effect: flag, reason, chain.
+  for (int K = 0; K < RTE_Count; ++K) {
+    Ops.push_back(
+        ConstantAsMetadata::get(ConstantInt::getBool(Ctx, *S.flagPtr(K))));
+    Ops.push_back(MDString::get(Ctx, *S.reasonPtr(K)));
+    Ops.push_back(MDString::get(Ctx, encodeChain(*S.chainPtr(K))));
+  }
+
   MDNode *N = MDNode::get(Ctx, Ops);
   F.setMetadata(MetadataName, N);
 }
 
-FunctionEffectSummary
-FunctionEffectSummary::readFromMetadata(Function &F) {
+FunctionEffectSummary FunctionEffectSummary::readFromMetadata(Function &F) {
   FunctionEffectSummary S;
   MDNode *N = F.getMetadata(MetadataName);
   if (!N || N->getNumOperands() < 5)
     return S;
 
-  if (auto *M = mdconst::dyn_extract<ConstantInt>(N->getOperand(0)))
-    S.MayBlock = M->getZExtValue();
+  auto *Tag = dyn_cast<MDString>(N->getOperand(0));
+  if (!Tag || Tag->getString() != MetadataVersionTag)
+    return S; // unsupported / older format -> defaults
+
   if (auto *M = mdconst::dyn_extract<ConstantInt>(N->getOperand(1)))
-    S.MayAlloc = M->getZExtValue();
-  if (auto *M = mdconst::dyn_extract<ConstantInt>(N->getOperand(2)))
     S.status =
         static_cast<FunctionEffectSummary::Status>(M->getZExtValue());
-  if (auto *M = dyn_cast<MDString>(N->getOperand(3)))
-    S.ReasonBlockFn = M->getString().str();
+  if (auto *M = mdconst::dyn_extract<ConstantInt>(N->getOperand(2)))
+    S.MaxStackDepth = static_cast<int>(M->getSExtValue());
+  if (auto *M = mdconst::dyn_extract<ConstantInt>(N->getOperand(3)))
+    S.IsEffectPolymorphic = M->getZExtValue();
   if (auto *M = dyn_cast<MDString>(N->getOperand(4)))
-    S.ReasonAllocFn = M->getString().str();
-  if (N->getNumOperands() >= 10) {
-    if (auto *M = mdconst::dyn_extract<ConstantInt>(N->getOperand(5)))
-      S.HasUnknown = M->getZExtValue();
-    if (auto *M = dyn_cast<MDString>(N->getOperand(6)))
-      S.ReasonUnknown = M->getString().str();
-    if (auto *M = dyn_cast<MDString>(N->getOperand(7)))
-      S.BlockChain = decodeChain(M->getString());
-    if (auto *M = dyn_cast<MDString>(N->getOperand(8)))
-      S.AllocChain = decodeChain(M->getString());
-    if (auto *M = dyn_cast<MDString>(N->getOperand(9)))
-      S.UnknownChain = decodeChain(M->getString());
+    S.PolyArgs = decodePolyArgs(M->getString());
+
+  unsigned Idx = 5;
+  for (int K = 0; K < RTE_Count; ++K) {
+    if (Idx + 2 >= N->getNumOperands())
+      break;
+    if (auto *M = mdconst::dyn_extract<ConstantInt>(N->getOperand(Idx)))
+      *S.flagPtr(K) = M->getZExtValue();
+    if (auto *M = dyn_cast<MDString>(N->getOperand(Idx + 1)))
+      *S.reasonPtr(K) = M->getString().str();
+    if (auto *M = dyn_cast<MDString>(N->getOperand(Idx + 2)))
+      *S.chainPtr(K) = decodeChain(M->getString());
+    Idx += 3;
   }
 
   return S;
