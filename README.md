@@ -4,18 +4,21 @@ Realtime Function Effect Analysis and Selective RealtimeSanitizer Instrumentatio
 
 ## Overview
 
-An out-of-tree LLVM 18 pass plugin that:
+An out-of-tree LLVM pass plugin, currently tested with LLVM 22, that:
 
-1. **Infers** `may_block` / `may_alloc` effects on LLVM IR via inter-procedural fixpoint analysis
-2. **Checks** real-time constraints on annotated functions, emitting diagnostics with witness call chains
-3. **Guides** selective RTSan instrumentation — statically proven-safe RT functions skip hooks, reducing runtime overhead
+1. **Infers** `may_block` / `may_alloc` / `unknown` effects on LLVM IR via inter-procedural fixpoint analysis
+2. **Tracks provenance** as call chains with instruction text and debug locations, stored in `!rt.effect`
+3. **Checks** real-time constraints on annotated functions, emitting text diagnostics and JSON Lines records
+4. **Guides** selective RTSan instrumentation: statically proven-safe RT functions skip hooks, while violating or unknown RT functions are instrumented
 
 ## Build
 
-Requires LLVM 18 development libraries.
+Requires LLVM development libraries and tools. The test environment currently
+uses LLVM 22. The code keeps a compatibility include for LLVM 18-style plugin
+headers.
 
 ```bash
-cmake -S . -B build -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+cmake -S . -B build -DLLVM_DIR="$(llvm-config --cmakedir)"
 cmake --build build -j$(nproc)
 ```
 
@@ -33,9 +36,10 @@ opt -load-pass-plugin=build/libRTEffect.so \
     -disable-output input.ll
 ```
 
-Scans all instructions for direct allocation/blocking calls, builds a call graph,
-and runs a worklist fixpoint to propagate effects transitively. Writes
-`FunctionEffectSummary` metadata on each function.
+Scans call instructions for direct allocation/blocking operations, indirect
+calls, and external declarations. It builds a call graph, runs a worklist
+fixpoint to propagate summaries transitively, marks recursive SCC provenance,
+and writes `FunctionEffectSummary` metadata on each function.
 
 Set the external function YAML table path via environment variable:
 ```bash
@@ -50,15 +54,31 @@ opt -load-pass-plugin=build/libRTEffect.so \
     -disable-output input.ll
 ```
 
-Reads function effect summaries and compares against real-time annotations
-(`__attribute__((annotate("rt_nonblocking")))` / `__attribute__((annotate("rt_nonallocating")))`).
-Emits diagnostics with witness call chains for violations.
+Reads function effect summaries and compares against real-time annotations.
+Diagnostics distinguish direct violations, transitive violations, and Unknown
+entries caused by indirect calls or missing external summaries. Each diagnostic
+prints the call chain, per-frame source location when `!dbg` is available, the
+leaf witness instruction, and a repair suggestion.
 
-Function annotations supplement standard Clang attributes:
+Supported IR/function markers are:
+- `"nonblocking"` / `"nonallocating"` function attributes
+- `__attribute__((annotate("rt_nonblocking")))`
+- `__attribute__((annotate("rt_nonallocating")))`
+
+Annotation fallback example:
 ```c
 __attribute__((annotate("rt_nonblocking")))
 __attribute__((annotate("rt_nonallocating")))
 void my_rt_handler(void) { ... }
+```
+
+Set `RTEFFECT_JSON_DIAGNOSTICS` to emit one JSON object per diagnostic:
+
+```bash
+RTEFFECT_JSON_DIAGNOSTICS=diag.jsonl \
+opt -load-pass-plugin=build/libRTEffect.so \
+    -passes="rt-effect-infer,rt-constraint-check" \
+    -disable-output input.ll
 ```
 
 ### Selective Instrumentation (default)
@@ -70,9 +90,12 @@ opt -load-pass-plugin=build/libRTEffect.so \
 ```
 
 Inserts `__rtsan_realtime_enter` / `__rtsan_realtime_exit` hooks:
-- **ProvenSafe** RT functions → **no hooks** (skipped)
+- **ProvenSafe** RT functions → **no hooks**, plus `!nosanitize_realtime`
 - **Violating** or **Unknown** RT functions → **hooks inserted**
 - Non-RT functions → skipped
+
+Exit hooks are inserted before normal returns and unwind exits such as `resume`,
+`cleanupret`, and `catchret`.
 
 ### Instrument-All Baseline
 
@@ -82,8 +105,9 @@ opt -load-pass-plugin=build/libRTEffect.so \
     -S input.ll
 ```
 
-Instruments **all** functions regardless of analysis results. Use for overhead
-comparison against selective mode.
+Instruments **all RT functions** regardless of analysis results. Non-RT
+functions remain untouched. Use this for overhead comparison against selective
+mode.
 
 ## External Function Table
 
@@ -101,8 +125,23 @@ comparison against selective mode.
   may_alloc: false
 ```
 
-Unknown external callees and indirect calls are treated conservatively
-(`may_block=true`, `may_alloc=true`).
+Unknown external callees and indirect calls are tracked as `unknown`, not as
+known `may_block` / `may_alloc` effects. Constraint checking reports them as
+Unknown diagnostics and selective RTSan placement instruments the affected RT
+functions.
+
+## RTSan Shim
+
+`rtsan_runtime/rtsan_shim.c` provides standalone hook definitions for tests and
+experiments:
+
+```c
+void __rtsan_realtime_enter(const char *func_name);
+void __rtsan_realtime_exit(const char *func_name);
+uint64_t __rtsan_realtime_enter_count(void);
+uint64_t __rtsan_realtime_exit_count(void);
+void __rtsan_realtime_reset_counts(void);
+```
 
 ## Architecture
 
@@ -114,7 +153,7 @@ Unknown external callees and indirect calls are treated conservatively
         │
         ▼  RTEffectInferPass
 [FunctionEffectSummary per function]
-  { may_block, may_alloc, status, reason_block, reason_alloc }
+  { may_block, may_alloc, unknown, status, provenance chains }
         │
         ▼  RTConstraintCheckPass
 [Diagnostics for violations]
@@ -129,9 +168,14 @@ Unknown external callees and indirect calls are treated conservatively
 struct FunctionEffectSummary {
     bool MayBlock;
     bool MayAlloc;
+    bool HasUnknown;
     enum Status { ProvenSafe=0, Violating=1, Unknown=2 } status;
-    std::string ReasonBlockFn;  // witness call chain
+    std::string ReasonBlockFn;
     std::string ReasonAllocFn;
+    std::string ReasonUnknown;
+    std::vector<RTProvenanceFrame> BlockChain;
+    std::vector<RTProvenanceFrame> AllocChain;
+    std::vector<RTProvenanceFrame> UnknownChain;
 };
 ```
 
@@ -142,15 +186,17 @@ inter-pass communication.
 
 ```bash
 pip install lit
-RTEFFECT_PLUGIN_DIR=build lit -v test/
+lit -v -j1 test/
 ```
 
 The test suite includes:
 - **IR-level tests** (`.ll`): direct allocation, blocking, helper chains,
   recursion/mutual recursion, indirect calls, constraint checks, selective
-  and instrument-all modes
+  and instrument-all modes, JSON diagnostics, metadata round-trip, Unknown
+  diagnostics, and unwind instrumentation
 - **Source-level tests** (`test/Inputs/*.c`): end-to-end from annotated C
-  through Clang to pass pipeline, verified with FileCheck
+  through Clang to pass pipeline, verified with FileCheck, including debug
+  source-location chains
 
 ## Project Structure
 
