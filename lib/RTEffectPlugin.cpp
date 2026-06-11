@@ -23,7 +23,15 @@ PassPluginLibraryInfo getRTEffectPluginInfo() {
                     return true;
                   }
                   if (Name == "rt-san-place") {
-                    MPM.addPass(RTSanPlacementPass());
+                    auto P = RTSanPlacementPass();
+                    P.PerCallSite = true;
+                    MPM.addPass(std::move(P));
+                    return true;
+                  }
+                  if (Name == "rt-san-place-whole") {
+                    auto P = RTSanPlacementPass();
+                    P.PerCallSite = false;
+                    MPM.addPass(std::move(P));
                     return true;
                   }
                   if (Name == "rt-san-place-all") {
