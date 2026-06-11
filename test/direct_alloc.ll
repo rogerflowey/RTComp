@@ -1,6 +1,6 @@
 ; RUN: %opt -load-pass-plugin=%plugin_dir/libRTEffect.so -passes="rt-effect-infer" -S %s -o /dev/null 2>&1 | %FileCheck %s
 
-; CHECK: may_block=0 may_alloc=1 [via malloc]
+; CHECK: may_block=0 may_alloc=1 unknown=0 [via malloc]
 ; CHECK: [via _Znwm]
 
 declare ptr @malloc(i64)

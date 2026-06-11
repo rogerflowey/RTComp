@@ -12,9 +12,10 @@
 #include "llvm/Plugins/PassPlugin.h"
 #endif
 #include "llvm/Support/raw_ostream.h"
-#include <set>
+#include <algorithm>
 #include <map>
 #include <queue>
+#include <set>
 #include <vector>
 
 using namespace llvm;
@@ -34,16 +35,58 @@ static const char *getExternalFuncFile() {
 
 namespace {
 
+std::string chainToReason(const std::vector<RTProvenanceFrame> &Chain,
+                          StringRef Fallback) {
+  std::string Reason;
+  for (const RTProvenanceFrame &Frame : Chain) {
+    StringRef Name = !Frame.CalleeName.empty() ? StringRef(Frame.CalleeName)
+                                               : StringRef(Frame.FunctionName);
+    if (Name.empty())
+      continue;
+    if (!Reason.empty())
+      Reason += " -> ";
+    Reason += Name.str();
+  }
+  if (Reason.empty())
+    Reason = Fallback.str();
+  return Reason;
+}
+
+void setKnownEffect(FunctionEffectSummary &Summary, Function &F,
+                    Instruction &I, StringRef CalleeName, StringRef Kind,
+                    bool MayBlock, bool MayAlloc) {
+  RTProvenanceFrame Frame =
+      FunctionEffectSummary::makeFrame(F, I, CalleeName, Kind);
+  if (MayBlock && !Summary.MayBlock) {
+    Summary.MayBlock = true;
+    Summary.BlockChain = {Frame};
+    Summary.ReasonBlockFn = chainToReason(Summary.BlockChain, CalleeName);
+  }
+  if (MayAlloc && !Summary.MayAlloc) {
+    Summary.MayAlloc = true;
+    Summary.AllocChain = {Frame};
+    Summary.ReasonAllocFn = chainToReason(Summary.AllocChain, CalleeName);
+  }
+}
+
+void setUnknownEffect(FunctionEffectSummary &Summary, Function &F,
+                      Instruction &I, StringRef CalleeName, StringRef Kind) {
+  if (Summary.HasUnknown)
+    return;
+  Summary.HasUnknown = true;
+  Summary.UnknownChain = {
+      FunctionEffectSummary::makeFrame(F, I, CalleeName, Kind)};
+  Summary.ReasonUnknown = chainToReason(Summary.UnknownChain, CalleeName);
+}
+
 void scanDirectEffects(Function &F, FunctionEffectSummary &Summary,
                        const ExternalFuncTable &ExtTable) {
   for (auto &BB : F) {
     for (auto &I : BB) {
       if (auto *CB = dyn_cast<CallBase>(&I)) {
         if (CB->isIndirectCall()) {
-          Summary.MayBlock = true;
-          Summary.MayAlloc = true;
-          Summary.ReasonBlockFn = "<indirect call>";
-          Summary.ReasonAllocFn = "<indirect call>";
+          setUnknownEffect(Summary, F, I, "<indirect call>",
+                           "indirect-call");
           continue;
         }
 
@@ -57,24 +100,64 @@ void scanDirectEffects(Function &F, FunctionEffectSummary &Summary,
           continue;
 
         if (auto *Info = ExtTable.lookup(CalleeName)) {
-          if (Info->MayBlock) {
-            Summary.MayBlock = true;
-            Summary.ReasonBlockFn = CalleeName.str();
-          }
-          if (Info->MayAlloc) {
-            Summary.MayAlloc = true;
-            Summary.ReasonAllocFn = CalleeName.str();
-          }
+          setKnownEffect(Summary, F, I, CalleeName, "external",
+                         Info->MayBlock, Info->MayAlloc);
           continue;
         }
 
         if (Callee->empty()) {
-          Summary.MayBlock = true;
-          Summary.MayAlloc = true;
-          Summary.ReasonBlockFn = CalleeName.str() + " <unknown external>";
-          Summary.ReasonAllocFn = CalleeName.str() + " <unknown external>";
+          setUnknownEffect(Summary, F, I, CalleeName, "unknown-external");
         }
       }
+    }
+  }
+}
+
+bool isRecursiveSCC(const std::vector<Function *> &SCC,
+                    const std::map<Function *, std::set<Function *>> &CallGraph) {
+  if (SCC.size() > 1)
+    return true;
+  if (SCC.empty())
+    return false;
+  auto It = CallGraph.find(SCC.front());
+  return It != CallGraph.end() && It->second.count(SCC.front());
+}
+
+void markRecursiveSources(
+    std::map<Function *, FunctionEffectSummary> &DirectEffects,
+    const std::map<Function *, std::set<Function *>> &CallGraph,
+    const std::vector<std::vector<Function *>> &SCCs) {
+  for (const auto &SCC : SCCs) {
+    if (!isRecursiveSCC(SCC, CallGraph))
+      continue;
+    for (Function *F : SCC) {
+      auto It = DirectEffects.find(F);
+      if (It == DirectEffects.end() || !It->second.hasAnyEffect())
+        continue;
+      RTProvenanceFrame Frame;
+      Frame.FunctionName = F->getName().str();
+      Frame.CalleeName = "<recursive-scc>";
+      Frame.Kind = "cycle";
+      if (DISubprogram *SP = F->getSubprogram()) {
+        Frame.File = SP->getFilename().str();
+        Frame.Line = SP->getLine();
+      }
+      auto Prefix = [&](std::vector<RTProvenanceFrame> &Chain) {
+        if (!Chain.empty() && Chain.front().Kind != "cycle")
+          Chain.insert(Chain.begin(), Frame);
+      };
+      Prefix(It->second.BlockChain);
+      Prefix(It->second.AllocChain);
+      Prefix(It->second.UnknownChain);
+      if (It->second.MayBlock)
+        It->second.ReasonBlockFn =
+            chainToReason(It->second.BlockChain, It->second.ReasonBlockFn);
+      if (It->second.MayAlloc)
+        It->second.ReasonAllocFn =
+            chainToReason(It->second.AllocChain, It->second.ReasonAllocFn);
+      if (It->second.HasUnknown)
+        It->second.ReasonUnknown =
+            chainToReason(It->second.UnknownChain, It->second.ReasonUnknown);
     }
   }
 }
@@ -133,6 +216,17 @@ void computeSCC(const std::map<Function *, std::set<Function *>> &CallGraph,
   }
 }
 
+std::vector<RTProvenanceFrame>
+prependCallFrame(Function &Caller, CallBase &CB, Function &Callee,
+                 StringRef Kind,
+                 const std::vector<RTProvenanceFrame> &CalleeChain) {
+  std::vector<RTProvenanceFrame> Chain;
+  Chain.push_back(
+      FunctionEffectSummary::makeFrame(Caller, CB, Callee.getName(), Kind));
+  Chain.insert(Chain.end(), CalleeChain.begin(), CalleeChain.end());
+  return Chain;
+}
+
 } // namespace
 
 PreservedAnalyses RTEffectInferPass::run(Module &M,
@@ -184,6 +278,7 @@ PreservedAnalyses RTEffectInferPass::run(Module &M,
 
   std::vector<std::vector<Function *>> SCCs;
   computeSCC(CallGraph, SCCs);
+  markRecursiveSources(DirectEffects, CallGraph, SCCs);
 
   auto FuncSummaries = DirectEffects;
 
@@ -200,22 +295,42 @@ PreservedAnalyses RTEffectInferPass::run(Module &M,
 
     auto CGIt = CallGraph.find(F);
     if (CGIt != CallGraph.end()) {
-      for (Function *Callee : CGIt->second) {
-        auto It = FuncSummaries.find(Callee);
-        if (It != FuncSummaries.end()) {
-          if (It->second.MayBlock) {
-            if (!NewSummary.MayBlock) {
-              NewSummary.MayBlock = true;
-              NewSummary.ReasonBlockFn =
-                  Callee->getName().str() + " -> " + It->second.ReasonBlockFn;
-            }
+      for (auto &BB : *F) {
+        for (auto &I : BB) {
+          auto *CB = dyn_cast<CallBase>(&I);
+          if (!CB || CB->isIndirectCall())
+            continue;
+          Function *Callee = CB->getCalledFunction();
+          if (!Callee || !CGIt->second.count(Callee))
+            continue;
+
+          auto It = FuncSummaries.find(Callee);
+          if (It == FuncSummaries.end())
+            continue;
+
+          if (It->second.MayBlock && !NewSummary.MayBlock) {
+            NewSummary.MayBlock = true;
+            NewSummary.BlockChain =
+                prependCallFrame(*F, *CB, *Callee, "call",
+                                 It->second.BlockChain);
+            NewSummary.ReasonBlockFn =
+                chainToReason(NewSummary.BlockChain, Callee->getName());
           }
-          if (It->second.MayAlloc) {
-            if (!NewSummary.MayAlloc) {
-              NewSummary.MayAlloc = true;
-              NewSummary.ReasonAllocFn =
-                  Callee->getName().str() + " -> " + It->second.ReasonAllocFn;
-            }
+          if (It->second.MayAlloc && !NewSummary.MayAlloc) {
+            NewSummary.MayAlloc = true;
+            NewSummary.AllocChain =
+                prependCallFrame(*F, *CB, *Callee, "call",
+                                 It->second.AllocChain);
+            NewSummary.ReasonAllocFn =
+                chainToReason(NewSummary.AllocChain, Callee->getName());
+          }
+          if (It->second.HasUnknown && !NewSummary.HasUnknown) {
+            NewSummary.HasUnknown = true;
+            NewSummary.UnknownChain =
+                prependCallFrame(*F, *CB, *Callee, "call",
+                                 It->second.UnknownChain);
+            NewSummary.ReasonUnknown =
+                chainToReason(NewSummary.UnknownChain, Callee->getName());
           }
         }
       }
@@ -224,8 +339,10 @@ PreservedAnalyses RTEffectInferPass::run(Module &M,
     auto &Old = FuncSummaries[F];
     if (NewSummary.MayBlock != Old.MayBlock ||
         NewSummary.MayAlloc != Old.MayAlloc ||
+        NewSummary.HasUnknown != Old.HasUnknown ||
         NewSummary.ReasonBlockFn != Old.ReasonBlockFn ||
-        NewSummary.ReasonAllocFn != Old.ReasonAllocFn) {
+        NewSummary.ReasonAllocFn != Old.ReasonAllocFn ||
+        NewSummary.ReasonUnknown != Old.ReasonUnknown) {
       Old = NewSummary;
 
       auto It = CallersOf.find(F);
@@ -242,11 +359,14 @@ PreservedAnalyses RTEffectInferPass::run(Module &M,
 
     auto &S = Pair.second;
     errs() << "  " << Pair.first->getName() << ": may_block=" << S.MayBlock
-           << " may_alloc=" << S.MayAlloc;
+           << " may_alloc=" << S.MayAlloc
+           << " unknown=" << S.HasUnknown;
     if (S.MayBlock)
       errs() << " [via " << S.ReasonBlockFn << "]";
     if (S.MayAlloc)
       errs() << " [via " << S.ReasonAllocFn << "]";
+    if (S.HasUnknown)
+      errs() << " [unknown via " << S.ReasonUnknown << "]";
     errs() << "\n";
   }
 

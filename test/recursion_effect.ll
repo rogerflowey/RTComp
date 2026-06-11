@@ -15,7 +15,7 @@ recurse:
 done:
   ret void
 }
-; CHECK: recurse_alloc: may_block=0 may_alloc=1 [via malloc]
+; CHECK: recurse_alloc: may_block=0 may_alloc=1 unknown=0 [via <recursive-scc> -> malloc]
 
 define void @mutual_a(i32 %n) {
   %cmp = icmp eq i32 %n, 0

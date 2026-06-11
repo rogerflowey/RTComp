@@ -11,7 +11,7 @@ define void @direct_lock(ptr %m) {
   call i32 @pthread_mutex_lock(ptr %m)
   ret void
 }
-; CHECK: direct_lock: may_block=1 may_alloc=0 [via pthread_mutex_lock]
+; CHECK: direct_lock: may_block=1 may_alloc=0 unknown=0 [via pthread_mutex_lock]
 
 define void @direct_sleep() {
   call i32 @sleep(i32 1)
@@ -33,4 +33,4 @@ loop:
 exit:
   ret void
 }
-; CHECK: safe_loop: may_block=0 may_alloc=0
+; CHECK: safe_loop: may_block=0 may_alloc=0 unknown=0
