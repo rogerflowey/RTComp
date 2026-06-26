@@ -14,6 +14,16 @@ LLVM_YAML_IS_SEQUENCE_VECTOR(ExternalFuncInfo)
 namespace llvm {
 namespace yaml {
 
+template <> struct ScalarEnumerationTraits<HeapKind> {
+  static void enumeration(IO &io, HeapKind &Value) {
+    io.enumCase(Value, "none",        HK_None);
+    io.enumCase(Value, "stack",       HK_Stack);
+    io.enumCase(Value, "global",      HK_Global);
+    io.enumCase(Value, "rtheap",      HK_RTHeap);
+    io.enumCase(Value, "normal_heap", HK_NormalHeap);
+  }
+};
+
 template <> struct MappingTraits<ExternalFuncInfo> {
   static void mapping(IO &io, ExternalFuncInfo &E) {
     io.mapOptional("may_block", E.MayBlock, false);
@@ -21,6 +31,7 @@ template <> struct MappingTraits<ExternalFuncInfo> {
     io.mapOptional("may_throw", E.MayThrow, false);
     io.mapOptional("may_lock", E.MayLock, false);
     io.mapOptional("may_signal_unsafe", E.MaySignalUnsafe, false);
+    io.mapOptional("heap_kind", E.AllocHeap, HK_None);
   }
 };
 
@@ -49,6 +60,7 @@ template <> struct MappingTraits<ExternalFuncYAMLEntry> {
     io.mapOptional("may_throw", E.Info.MayThrow, false);
     io.mapOptional("may_lock", E.Info.MayLock, false);
     io.mapOptional("may_signal_unsafe", E.Info.MaySignalUnsafe, false);
+    io.mapOptional("heap_kind", E.Info.AllocHeap, HK_None);
   }
 };
 

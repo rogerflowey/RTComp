@@ -1,21 +1,26 @@
 - name: malloc
   may_block: false
   may_alloc: true
+  heap_kind: normal_heap
 - name: calloc
   may_block: false
   may_alloc: true
+  heap_kind: normal_heap
 - name: realloc
   may_block: false
   may_alloc: true
+  heap_kind: normal_heap
 - name: free
   may_block: true
   may_alloc: false
 - name: _Znwm
   may_block: false
   may_alloc: true
+  heap_kind: normal_heap
 - name: _Znam
   may_block: false
   may_alloc: true
+  heap_kind: normal_heap
 - name: _ZdlPv
   may_block: true
   may_alloc: false
@@ -25,15 +30,19 @@
 - name: strdup
   may_block: false
   may_alloc: true
+  heap_kind: normal_heap
 - name: _strdup
   may_block: false
   may_alloc: true
+  heap_kind: normal_heap
 - name: asprintf
   may_block: false
   may_alloc: true
+  heap_kind: normal_heap
 - name: vasprintf
   may_block: false
   may_alloc: true
+  heap_kind: normal_heap
 - name: pthread_mutex_lock
   may_block: true
   may_alloc: false
@@ -158,12 +167,14 @@
 - name: fopen
   may_block: true
   may_alloc: true
+  heap_kind: normal_heap
 - name: fclose
   may_block: true
   may_alloc: false
 - name: fdopen
   may_block: false
   may_alloc: true
+  heap_kind: normal_heap
 - name: mkfifo
   may_block: true
   may_alloc: false
@@ -197,27 +208,35 @@
 - name: brk
   may_block: false
   may_alloc: true
+  heap_kind: normal_heap
 - name: sbrk
   may_block: false
   may_alloc: true
+  heap_kind: normal_heap
 - name: posix_memalign
   may_block: false
   may_alloc: true
+  heap_kind: normal_heap
 - name: aligned_alloc
   may_block: false
   may_alloc: true
+  heap_kind: normal_heap
 - name: memalign
   may_block: false
   may_alloc: true
+  heap_kind: normal_heap
 - name: valloc
   may_block: false
   may_alloc: true
+  heap_kind: normal_heap
 - name: pvalloc
   may_block: false
   may_alloc: true
+  heap_kind: normal_heap
 - name: dlopen
   may_block: true
   may_alloc: true
+  heap_kind: normal_heap
 - name: dlsym
   may_block: false
   may_alloc: false
@@ -270,10 +289,12 @@
   may_block: false
   may_alloc: true
   may_throw: true
+  heap_kind: normal_heap
 - name: __cxa_throw
   may_block: false
   may_alloc: true
   may_throw: true
+  heap_kind: normal_heap
 - name: __cxa_rethrow
   may_block: false
   may_alloc: false
@@ -297,9 +318,26 @@
 - name: malloc
   may_signal_unsafe: true
   may_alloc: true
+  heap_kind: normal_heap
 - name: printf
   may_signal_unsafe: true
   may_block: true
 - name: fprintf
   may_signal_unsafe: true
   may_block: true
+# ---------------------------------------------------------------------------
+# Real-time-safe heap allocators (pre-allocated pool, no syscall).
+# These are annotated heap_kind: rtheap so nonallocating RT functions that
+# only reach them are still ProvenSafe.
+# ---------------------------------------------------------------------------
+- name: rt_malloc
+  may_block: false
+  may_alloc: true
+  heap_kind: rtheap
+- name: rt_free
+  may_block: false
+  may_alloc: false
+- name: rt_realloc
+  may_block: false
+  may_alloc: true
+  heap_kind: rtheap

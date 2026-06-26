@@ -14,6 +14,7 @@ struct ExternalFuncInfo {
   bool MayThrow = false;
   bool MayLock = false;
   bool MaySignalUnsafe = false;
+  HeapKind AllocHeap = HK_None;
 };
 
 class ExternalFuncTable {
