@@ -168,9 +168,10 @@ StringRef suggestionFor(StringRef Kind, StringRef Constraint) {
   if (Constraint == "nonblocking")
     return "Move blocking work outside the real-time path or use a "
            "nonblocking API.";
-  if (Constraint == "nonallocating")
+  if (Constraint == "nonallocating") {
     return "Preallocate memory, use stack/RT heap storage, or remove "
            "heap allocation from the real-time path.";
+  }
   if (Constraint == "nothrow")
     return "Replace the throwing call with an error-code variant or "
            "guard the call with noexcept-equivalent wrappers.";
@@ -192,12 +193,14 @@ void writeJsonDiagnostic(raw_ostream &OS, Function &F, StringRef Kind,
                          StringRef Constraint, StringRef Effect,
                          StringRef Confidence,
                          const std::vector<RTProvenanceFrame> &Chain,
-                         StringRef Suggestion) {
+                         StringRef Suggestion, StringRef HeapKindStr) {
   OS << "{\"function\":\"" << escapeJson(F.getName()) << "\",";
   OS << "\"kind\":\"" << Kind << "\",";
   OS << "\"constraint\":\"" << Constraint << "\",";
   OS << "\"effect\":\"" << Effect << "\",";
   OS << "\"confidence\":\"" << Confidence << "\",";
+  if (!HeapKindStr.empty())
+    OS << "\"heap_kind\":\"" << HeapKindStr << "\",";
   OS << "\"suggestion\":\"" << escapeJson(Suggestion) << "\",";
   OS << "\"chain\":[";
   for (size_t I = 0; I < Chain.size(); ++I) {
@@ -232,6 +235,7 @@ struct SarifResult {
   std::string Effect;
   std::string Confidence;
   std::string Suggestion;
+  std::string HeapKindStr;
   std::vector<RTProvenanceFrame> Chain;
 };
 
@@ -314,6 +318,8 @@ void writeSarifReport(raw_ostream &OS,
     OS << "\"kind\":\"" << escapeJson(R.Kind) << "\",";
     OS << "\"effect\":\"" << escapeJson(R.Effect) << "\",";
     OS << "\"confidence\":\"" << escapeJson(R.Confidence) << "\"";
+    if (!R.HeapKindStr.empty())
+      OS << ",\"heap_kind\":\"" << escapeJson(R.HeapKindStr) << "\"";
     OS << "}";
     OS << "}";
   }
@@ -324,7 +330,8 @@ void emitDiagnostic(Function &F, StringRef Kind, StringRef Constraint,
                     StringRef Effect, StringRef Reason,
                     const std::vector<RTProvenanceFrame> &Chain,
                     raw_ostream *JsonOS,
-                    std::vector<SarifResult> *SarifAcc) {
+                    std::vector<SarifResult> *SarifAcc,
+                    StringRef HeapKindStr = {}) {
   StringRef Confidence = Kind == "Unknown" ? "low" : "high";
   StringRef Suggestion = suggestionFor(Kind, Constraint);
 
@@ -332,13 +339,15 @@ void emitDiagnostic(Function &F, StringRef Kind, StringRef Constraint,
          << F.getName() << ": " << Effect;
   if (!Reason.empty())
     errs() << " via " << Reason;
+  if (!HeapKindStr.empty())
+    errs() << " [heap: " << HeapKindStr << "]";
   errs() << "\n";
   printChain(errs(), Chain);
   errs() << "    suggestion: " << Suggestion << "\n";
 
   if (JsonOS)
     writeJsonDiagnostic(*JsonOS, F, Kind, Constraint, Effect, Confidence, Chain,
-                        Suggestion);
+                        Suggestion, HeapKindStr);
 
   if (SarifAcc) {
     SarifResult R;
@@ -348,6 +357,7 @@ void emitDiagnostic(Function &F, StringRef Kind, StringRef Constraint,
     R.Effect = Effect.str();
     R.Confidence = Confidence.str();
     R.Suggestion = Suggestion.str();
+    R.HeapKindStr = HeapKindStr.str();
     R.Chain = Chain;
     SarifAcc->push_back(std::move(R));
   }
@@ -408,17 +418,30 @@ PreservedAnalyses RTConstraintCheckPass::run(Module &M,
       if (!hasConstraint(F, CM.Constraint))
         continue;
       HasAnyConstraint = true;
-      if (*Summary.flagPtr(CM.EffectKind)) {
+
+      // For nonallocating, only NormalHeap allocations are real violations.
+      // Stack, Global, and RTHeap are real-time-safe.
+      bool Violates = *Summary.flagPtr(CM.EffectKind);
+      if (Violates && CM.EffectKind == RTE_Alloc &&
+          Summary.MayAllocHeapKind < HK_NormalHeap)
+        Violates = false;
+
+      if (Violates) {
         AnyViolation = true;
         Violations++;
         StringRef KindStr =
             classifyChain(F, *Summary.chainPtr(CM.EffectKind), false);
+        StringRef HKStr;
+        if (CM.EffectKind == RTE_Alloc)
+          HKStr = FunctionEffectSummary::heapKindName(
+              Summary.MayAllocHeapKind);
         emitDiagnostic(F, KindStr, CM.Constraint,
                        effectName(CM.Constraint),
                        *Summary.reasonPtr(CM.EffectKind),
                        *Summary.chainPtr(CM.EffectKind),
                        JsonFile.get(),
-                       SarifEnabled ? &SarifBuf : nullptr);
+                       SarifEnabled ? &SarifBuf : nullptr,
+                       HKStr);
       }
     }
 
