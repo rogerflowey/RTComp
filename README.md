@@ -217,6 +217,43 @@ Instruments **all RT functions** regardless of analysis results. Non-RT
 functions remain untouched. Use this for overhead comparison against selective
 mode.
 
+## Audio Target & Evaluation
+
+`bench/audio_target/audio_target.cpp` is a realistic audio processing example
+built around miniaudio (real-time callback) and dr_wav (WAV file I/O) APIs.
+The audio callback is annotated `nonblocking` / `nonallocating` / `nolock` and
+contains three intentional violations in a cold path:
+
+| Violation | Call chain | Constraint |
+|-----------|-----------|------------|
+| `scratch_alloc_and_copy` → `malloc` | NormalHeap allocation | `nonallocating` |
+| `scratch_alloc_and_copy` → `free` | Blocking deallocation | `nonblocking` |
+| `locked_buffer_copy` → `pthread_mutex_lock` | Lock acquisition | `nolock` |
+
+Safe hot-path helpers (`apply_gain`, `lowpass_filter`, `clamp`) are correctly
+classified as ProvenSafe with `heap_kind=stack`.
+
+### Demo (one command)
+
+```bash
+scripts/demo.sh
+```
+
+Displays annotated source, runs inference + constraint-check + selective
+instrumentation, prints violation provenance chains, and compares
+instrument-all vs selective hook counts.
+
+### Evaluation (three-mode)
+
+```bash
+scripts/eval_audio.sh
+```
+
+Runs three modes and produces a Markdown results table:
+- **check**: inference + constraint-check (violation count)
+- **instrument-all**: every RT function wrapped (baseline overhead)
+- **selective**: only violating call-sites wrapped (optimized)
+
 ## External Function Table
 
 `external_funcs.yaml` maps known library functions to their real-time effects:
