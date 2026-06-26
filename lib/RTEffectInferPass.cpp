@@ -15,6 +15,7 @@
 #include "llvm/Plugins/PassPlugin.h"
 #endif
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/FileSystem.h"
 #include <algorithm>
 #include <map>
 #include <queue>
@@ -93,6 +94,15 @@ void setEffect(FunctionEffectSummary &S, int Kind, Function &F, Instruction &I,
   *S.reasonPtr(Kind) = chainToReason(*S.chainPtr(Kind), CalleeName);
 }
 
+void setHeapKind(FunctionEffectSummary &S, HeapKind HK, Function &F,
+                 Instruction &I, StringRef CalleeName, StringRef FrameKind) {
+  if (HK <= S.MayAllocHeapKind)
+    return;
+  S.MayAllocHeapKind = HK;
+  S.AllocHeapChain = {FunctionEffectSummary::makeFrame(F, I, CalleeName,
+                                                       FrameKind)};
+}
+
 void mergeChainPrepended(
     FunctionEffectSummary &Caller, int Kind, Function &CallerF,
     CallBase &CB, Function &Callee,
@@ -107,6 +117,32 @@ void mergeChainPrepended(
   *Caller.chainPtr(Kind) = std::move(Chain);
   *Caller.reasonPtr(Kind) =
       chainToReason(*Caller.chainPtr(Kind), Callee.getName());
+}
+
+void prependHeapChain(FunctionEffectSummary &Caller, HeapKind HK,
+                      Function &CallerF, CallBase &CB, Function &Callee,
+                      const std::vector<RTProvenanceFrame> &CalleeChain) {
+  if (HK <= Caller.MayAllocHeapKind)
+    return;
+  Caller.MayAllocHeapKind = HK;
+  std::vector<RTProvenanceFrame> Chain;
+  Chain.push_back(FunctionEffectSummary::makeFrame(
+      CallerF, CB, Callee.getName(), "call"));
+  Chain.insert(Chain.end(), CalleeChain.begin(), CalleeChain.end());
+  Caller.AllocHeapChain = std::move(Chain);
+}
+
+bool accessesGlobalVariable(Instruction &I) {
+  for (Use &Op : I.operands()) {
+    if (isa<GlobalVariable>(Op.get()))
+      return true;
+    if (auto *CE = dyn_cast<ConstantExpr>(Op.get())) {
+      for (Use &CEO : CE->operands())
+        if (isa<GlobalVariable>(CEO.get()))
+          return true;
+    }
+  }
+  return false;
 }
 
 // Attaches !rt.witness = {!"<kind>", ...} to an instruction so the
@@ -345,8 +381,21 @@ PreservedAnalyses RTEffectInferPass::run(Module &M, ModuleAnalysisManager &AM) {
 
     for (auto &BB : F) {
       for (auto &I : BB) {
+        if (!inScope(&I))
+          continue;
+
+        if (isa<AllocaInst>(&I)) {
+          setHeapKind(Summary, HK_Stack, F, I, "<alloca>", "stack-alloc");
+          continue;
+        }
+
+        if (accessesGlobalVariable(I)) {
+          setHeapKind(Summary, HK_Global, F, I, "<global>",
+                      "global-access");
+        }
+
         auto *CB = dyn_cast<CallBase>(&I);
-        if (!CB || !inScope(&I))
+        if (!CB)
           continue;
 
         // Track may_throw for invoke instructions (LLVM has marked them
@@ -407,6 +456,8 @@ PreservedAnalyses RTEffectInferPass::run(Module &M, ModuleAnalysisManager &AM) {
           if (Info->MayAlloc) {
             setEffect(Summary, RTE_Alloc, F, I, CalleeName, "external");
             Witnesses.push_back(RTE_Alloc);
+            setHeapKind(Summary, Info->AllocHeap, F, I, CalleeName,
+                        "external");
           }
           if (Info->MayThrow) {
             setEffect(Summary, RTE_Throw, F, I, CalleeName, "external");
@@ -613,6 +664,10 @@ PreservedAnalyses RTEffectInferPass::run(Module &M, ModuleAnalysisManager &AM) {
                                   *It->second.chainPtr(K));
             }
           }
+          if (It->second.MayAllocHeapKind > NewSummary.MayAllocHeapKind) {
+            prependHeapChain(NewSummary, It->second.MayAllocHeapKind,
+                             *F, *CB, *Callee, It->second.AllocHeapChain);
+          }
         }
       }
 
@@ -650,6 +705,19 @@ PreservedAnalyses RTEffectInferPass::run(Module &M, ModuleAnalysisManager &AM) {
                 chainToReason(*NewSummary.chainPtr(K), C->getName());
           }
         }
+        if (It->second.MayAllocHeapKind > NewSummary.MayAllocHeapKind) {
+          NewSummary.MayAllocHeapKind = It->second.MayAllocHeapKind;
+          std::vector<RTProvenanceFrame> Chain;
+          RTProvenanceFrame Frame;
+          Frame.FunctionName = F->getName().str();
+          Frame.CalleeName = C->getName().str();
+          Frame.Kind = "indirect-resolved";
+          Chain.push_back(Frame);
+          Chain.insert(Chain.end(),
+                       It->second.AllocHeapChain.begin(),
+                       It->second.AllocHeapChain.end());
+          NewSummary.AllocHeapChain = std::move(Chain);
+        }
       }
     }
 
@@ -662,6 +730,9 @@ PreservedAnalyses RTEffectInferPass::run(Module &M, ModuleAnalysisManager &AM) {
         break;
       }
     }
+    if (!Changed &&
+        NewSummary.MayAllocHeapKind != Old.MayAllocHeapKind)
+      Changed = true;
     if (Changed) {
       Old = NewSummary;
       auto It = CallersOf.find(F);
@@ -733,6 +804,20 @@ PreservedAnalyses RTEffectInferPass::run(Module &M, ModuleAnalysisManager &AM) {
                   chainToReason(*CallerSum.chainPtr(K), ActualF->getName());
               DirtyForCallers = true;
             }
+          }
+          if (AIt->second.MayAllocHeapKind > CallerSum.MayAllocHeapKind) {
+            CallerSum.MayAllocHeapKind = AIt->second.MayAllocHeapKind;
+            std::vector<RTProvenanceFrame> Chain;
+            RTProvenanceFrame Frame;
+            Frame.FunctionName = CallerF->getName().str();
+            Frame.CalleeName = ActualF->getName().str();
+            Frame.Kind = "poly-resolved";
+            Chain.push_back(Frame);
+            Chain.insert(Chain.end(),
+                         AIt->second.AllocHeapChain.begin(),
+                         AIt->second.AllocHeapChain.end());
+            CallerSum.AllocHeapChain = std::move(Chain);
+            DirtyForCallers = true;
           }
         }
       }
@@ -852,7 +937,8 @@ PreservedAnalyses RTEffectInferPass::run(Module &M, ModuleAnalysisManager &AM) {
            << " may_recurse=" << S.MayRecurse
            << " may_signal_unsafe=" << S.MaySignalUnsafe
            << " unknown=" << S.HasUnknown
-           << " stack_depth=" << S.MaxStackDepth;
+           << " stack_depth=" << S.MaxStackDepth
+           << " heap_kind=" << FunctionEffectSummary::heapKindName(S.MayAllocHeapKind);
     if (S.IsEffectPolymorphic) {
       errs() << " poly_args=[";
       for (size_t I = 0; I < S.PolyArgs.size(); ++I) {
@@ -869,6 +955,48 @@ PreservedAnalyses RTEffectInferPass::run(Module &M, ModuleAnalysisManager &AM) {
     if (S.MaySignalUnsafe)  errs() << " [sigunsafe via " << S.ReasonSignalUnsafeFn << "]";
     if (S.HasUnknown)       errs() << " [unknown via " << S.ReasonUnknown << "]";
     errs() << "\n";
+  }
+
+  // Export inferred summaries as YAML for cross-module consumption.
+  const char *ExportPath = getenv("RTEFFECT_EXPORT_YAML");
+  if (ExportPath && ExportPath[0]) {
+    std::error_code EC;
+    raw_fd_ostream ExportOS(ExportPath, EC, sys::fs::OF_Text);
+    if (EC) {
+      errs() << "[RTEffectInferPass] Warning: could not open YAML export '"
+             << ExportPath << "': " << EC.message() << "\n";
+    } else {
+      ExportOS << "# Exported by RTEffectInferPass — compatible with "
+                  "external_funcs.yaml.\n";
+      for (Function &F : M) {
+        if (F.isDeclaration() || F.empty())
+          continue;
+        if (isRegionMarker(&F))
+          continue;
+        FunctionEffectSummary S =
+            FunctionEffectSummary::readFromMetadata(F);
+        ExportOS << "- name: " << F.getName() << "\n";
+        if (S.MayBlock)
+          ExportOS << "  may_block: true\n";
+        if (S.MayAlloc)
+          ExportOS << "  may_alloc: true\n";
+        if (S.MayThrow)
+          ExportOS << "  may_throw: true\n";
+        if (S.MayLock)
+          ExportOS << "  may_lock: true\n";
+        if (S.MayRecurse)
+          ExportOS << "  may_recurse: true\n";
+        if (S.MaySignalUnsafe)
+          ExportOS << "  may_signal_unsafe: true\n";
+        if (S.MayAllocHeapKind != HK_None)
+          ExportOS << "  heap_kind: "
+                   << FunctionEffectSummary::heapKindName(
+                          S.MayAllocHeapKind)
+                   << "\n";
+      }
+      errs() << "[RTEffectInferPass] Exported effect summaries to "
+             << ExportPath << "\n";
+    }
   }
 
   return PreservedAnalyses::all();
