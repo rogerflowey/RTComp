@@ -341,3 +341,91 @@
   may_block: false
   may_alloc: true
   heap_kind: rtheap
+# ---------------------------------------------------------------------------
+# miniaudio — real-time audio playback/capture library.
+# Device init/start/uninit are blocking + may allocate.
+# Callback dispatch is called from the audio thread (must be RT-safe).
+# ---------------------------------------------------------------------------
+- name: ma_device_init
+  may_block: true
+  may_alloc: true
+  heap_kind: normal_heap
+- name: ma_device_start
+  may_block: true
+  may_alloc: false
+- name: ma_device_stop
+  may_block: true
+  may_alloc: false
+- name: ma_device_uninit
+  may_block: true
+  may_alloc: false
+- name: ma_engine_init
+  may_block: true
+  may_alloc: true
+  heap_kind: normal_heap
+- name: ma_engine_uninit
+  may_block: true
+  may_alloc: false
+- name: ma_engine_play_sound
+  may_block: false
+  may_alloc: false
+- name: ma_encoder_init
+  may_block: false
+  may_alloc: true
+  heap_kind: normal_heap
+- name: ma_encoder_uninit
+  may_block: false
+  may_alloc: false
+- name: ma_encoder_write_pcm_frames
+  may_block: true
+  may_alloc: false
+- name: ma_decoder_init
+  may_block: false
+  may_alloc: true
+  heap_kind: normal_heap
+- name: ma_decoder_uninit
+  may_block: false
+  may_alloc: false
+- name: ma_decoder_read_pcm_frames
+  may_block: true
+  may_alloc: false
+# ---------------------------------------------------------------------------
+# dr_wav — single-header WAV file reader.
+# File open / read are blocking I/O + allocate internal buffers.
+# ---------------------------------------------------------------------------
+- name: drwav_open_file
+  may_block: true
+  may_alloc: true
+  heap_kind: normal_heap
+- name: drwav_open_file_and_read_pcm_frames_f32
+  may_block: true
+  may_alloc: true
+  heap_kind: normal_heap
+- name: drwav_open_file_and_read_pcm_frames_s16
+  may_block: true
+  may_alloc: true
+  heap_kind: normal_heap
+- name: drwav_read_pcm_frames_f32
+  may_block: true
+  may_alloc: false
+- name: drwav_read_pcm_frames_s16
+  may_block: true
+  may_alloc: false
+- name: drwav_close
+  may_block: false
+  may_alloc: false
+- name: drwav_init_file
+  may_block: true
+  may_alloc: true
+  heap_kind: normal_heap
+- name: drwav_uninit
+  may_block: false
+  may_alloc: false
+- name: drwav_open_memory
+  may_block: false
+  may_alloc: true
+  heap_kind: normal_heap
+- name: drwav_open_memory_and_read_pcm_frames_f32
+  may_block: false
+  may_alloc: true
+  heap_kind: normal_heap
