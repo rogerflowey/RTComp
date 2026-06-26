@@ -29,6 +29,16 @@ enum RTEffectKind {
   RTE_Count,
 };
 
+// Heap/memory-source classification. Higher values are "worse" —
+// merge-max determines the transitive heap kind.
+enum HeapKind {
+  HK_None       = 0,  // no heap activity
+  HK_Stack      = 1,  // alloca / stack-local
+  HK_Global     = 2,  // global-variable accesses
+  HK_RTHeap     = 3,  // real-time-safe heap (pre-allocated pool)
+  HK_NormalHeap = 4,  // general-purpose heap (malloc / new)
+};
+
 struct FunctionEffectSummary {
   bool MayBlock = false;
   bool MayAlloc = false;
@@ -40,6 +50,11 @@ struct FunctionEffectSummary {
 
   // Bounded stack-depth (number of frames including this one). -1 is unbounded.
   int MaxStackDepth = 1;
+
+  // Heap-kind classification. When MayAlloc is true this tells us
+  // *where* the allocation happens. Merge rule: max(HK_None, ...).
+  HeapKind MayAllocHeapKind = HK_None;
+  std::vector<RTProvenanceFrame> AllocHeapChain;
 
   // Effect-polymorphism: this function forwards effects through one or more
   // function-typed parameters. The vector lists the parameter indices.
@@ -77,6 +92,7 @@ struct FunctionEffectSummary {
   std::vector<RTProvenanceFrame> *chainPtr(int K);
   const std::vector<RTProvenanceFrame> *chainPtr(int K) const;
   static const char *kindName(int K);
+  static const char *heapKindName(int HK);
 
   void merge(const FunctionEffectSummary &Other);
   bool hasAnyEffect() const;

@@ -15,7 +15,7 @@ const StringLiteral FunctionEffectSummary::MetadataName = "rt.effect";
 namespace {
 
 // Format token. Bump when on-disk layout changes incompatibly.
-const char *MetadataVersionTag = "rt.effect.v2";
+const char *MetadataVersionTag = "rt.effect.v3";
 
 std::string escapeField(StringRef S) {
   std::string Out;
@@ -215,6 +215,17 @@ const char *FunctionEffectSummary::kindName(int K) {
   return "?";
 }
 
+const char *FunctionEffectSummary::heapKindName(int HK) {
+  switch (HK) {
+  case HK_None:       return "none";
+  case HK_Stack:      return "stack";
+  case HK_Global:     return "global";
+  case HK_RTHeap:     return "rtheap";
+  case HK_NormalHeap: return "normal_heap";
+  }
+  return "?";
+}
+
 void FunctionEffectSummary::merge(const FunctionEffectSummary &Other) {
   for (int K = 0; K < RTE_Count; ++K) {
     if (*Other.flagPtr(K) && !*flagPtr(K)) {
@@ -227,6 +238,10 @@ void FunctionEffectSummary::merge(const FunctionEffectSummary &Other) {
     MaxStackDepth = -1;
   else if (MaxStackDepth != -1 && Other.MaxStackDepth > MaxStackDepth)
     MaxStackDepth = Other.MaxStackDepth;
+  if (Other.MayAllocHeapKind > MayAllocHeapKind) {
+    MayAllocHeapKind = Other.MayAllocHeapKind;
+    AllocHeapChain = Other.AllocHeapChain;
+  }
 }
 
 bool FunctionEffectSummary::hasAnyEffect() const {
@@ -263,7 +278,8 @@ void FunctionEffectSummary::writeToMetadata(Function &F,
   LLVMContext &Ctx = F.getContext();
   SmallVector<Metadata *, 32> Ops;
 
-  // Header: version tag, status, stack depth, polymorphism flag, poly arg list.
+  // Header: version tag, status, stack depth, polymorphism flag, poly arg list,
+  // heap-kind, heap-chain.
   Ops.push_back(MDString::get(Ctx, MetadataVersionTag));
   Ops.push_back(ConstantAsMetadata::get(
       ConstantInt::get(Type::getInt32Ty(Ctx), static_cast<int>(S.status))));
@@ -272,6 +288,9 @@ void FunctionEffectSummary::writeToMetadata(Function &F,
   Ops.push_back(ConstantAsMetadata::get(
       ConstantInt::getBool(Ctx, S.IsEffectPolymorphic)));
   Ops.push_back(MDString::get(Ctx, encodePolyArgs(S.PolyArgs)));
+  Ops.push_back(ConstantAsMetadata::get(
+      ConstantInt::get(Type::getInt32Ty(Ctx), static_cast<int>(S.MayAllocHeapKind))));
+  Ops.push_back(MDString::get(Ctx, encodeChain(S.AllocHeapChain)));
 
   // Per-effect: flag, reason, chain.
   for (int K = 0; K < RTE_Count; ++K) {
@@ -292,7 +311,12 @@ FunctionEffectSummary FunctionEffectSummary::readFromMetadata(Function &F) {
     return S;
 
   auto *Tag = dyn_cast<MDString>(N->getOperand(0));
-  if (!Tag || Tag->getString() != MetadataVersionTag)
+  if (!Tag)
+    return S;
+
+  StringRef TagStr = Tag->getString();
+  bool IsV2 = (TagStr == "rt.effect.v2");
+  if (TagStr != MetadataVersionTag && !IsV2)
     return S; // unsupported / older format -> defaults
 
   if (auto *M = mdconst::dyn_extract<ConstantInt>(N->getOperand(1)))
@@ -306,6 +330,15 @@ FunctionEffectSummary FunctionEffectSummary::readFromMetadata(Function &F) {
     S.PolyArgs = decodePolyArgs(M->getString());
 
   unsigned Idx = 5;
+
+  if (!IsV2 && Idx + 1 < N->getNumOperands()) {
+    if (auto *M = mdconst::dyn_extract<ConstantInt>(N->getOperand(Idx)))
+      S.MayAllocHeapKind = static_cast<HeapKind>(M->getZExtValue());
+    if (auto *M = dyn_cast<MDString>(N->getOperand(Idx + 1)))
+      S.AllocHeapChain = decodeChain(M->getString());
+    Idx += 2;
+  }
+
   for (int K = 0; K < RTE_Count; ++K) {
     if (Idx + 2 >= N->getNumOperands())
       break;
