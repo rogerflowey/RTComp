@@ -1,0 +1,11 @@
+[package]
+name = "rt_attr_smoke"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rt = { path = "../../rust_attr/rt" }
+
+[[bin]]
+name = "rt_attr_smoke"
+path = "src/main.rs"

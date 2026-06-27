@@ -61,3 +61,23 @@ option(RTEFFECT_BUILD_CLANG_PLUGIN "Build the [[rt::]] Clang attribute plugin" O
 if(RTEFFECT_BUILD_CLANG_PLUGIN)
   add_subdirectory(clang_plugin)
 endif()
+
+# Optional: build the Rust `#[rt::...]` proc-macro crates when cargo/rustc
+# are present. The produced rlib/proc-macro so files let Rust source files
+# use the `#[rt::nonblocking]` annotation pathway under the same analysis
+# pipeline as the C++ `[[rt::*]]` plugin.
+option(RTEFFECT_BUILD_RUST_CRATES "Build the rt / rt_attr Rust crates" ON)
+if(RTEFFECT_BUILD_RUST_CRATES)
+  find_program(CARGO_EXE cargo)
+  find_program(RUSTC_EXE rustc)
+  if(CARGO_EXE AND RUSTC_EXE)
+    add_custom_target(rt_attr_crate ALL
+      COMMAND ${CARGO_EXE} build --release --manifest-path
+              ${CMAKE_SOURCE_DIR}/rust_attr/Cargo.toml
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/rust_attr
+      COMMENT "Building Rust #[rt::*] proc-macro crates"
+      VERBATIM)
+  else()
+    message(STATUS "cargo/rustc not found; skipping Rust crate build")
+  endif()
+endif()

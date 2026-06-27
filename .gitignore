@@ -2,3 +2,8 @@ build/
 test/Output/
 test/.lit_test_times.txt
 build/test/.lit_test_times.txt
+bench/out/
+
+# Cargo build artefacts and per-target caches (Rust #[rt::*] pathway)
+**/target/
+**/Cargo.lock

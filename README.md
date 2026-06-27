@@ -32,6 +32,12 @@ An out-of-tree LLVM pass plugin, currently tested with LLVM 22, that:
    languages to `.bc` with `rustc --emit=llvm-bc` / `clang++ -emit-llvm`,
    merge with `llvm-link`, and run the full analysis pipeline on the
    combined module.
+10. **Rust RT annotations** (`#[rt::nonblocking]` / `#[rt::nonallocating]` /
+    `#[rt::nolock]` / `#[rt::nothrow]` / `#[rt::norecurse]` /
+    `#[rt::async_signal_safe]` / `#[rt::stack_bound(N)]`) declared via the
+    bundled `rt_attr` proc-macro, on equal footing with the C++
+    `[[rt::*]]` Clang plugin. Rust function entry-points are first-class
+    real-time constrained functions (not just callees) under this pathway.
 
 ## Build
 
@@ -148,6 +154,81 @@ __attribute__((annotate("rt_nonblocking")))
 __attribute__((annotate("rt_nonallocating")))
 void my_rt_handler(void) { ... }
 ```
+
+### Rust `#[rt::*]` annotations
+
+The bundled `rust_attr/` Cargo workspace provides the `rt_attr` proc-macro
+crate and the `rt` facade crate. Together they expose `#[rt::*]` attributes
+that take the Rust RT-pathway:
+
+```rust
+use rt;
+
+#[rt::nonblocking]
+#[rt::nonallocating]
+extern "C" fn audio_callback(p_out: *mut f32, n: u32, rare: u32) {
+    // …pure DSP…
+}
+
+#[rt::stack_bound(64)]
+extern "C" fn on_signal(sig: i32) { /* ... */ }
+```
+
+Build the crates once (CMake does this as the `rt_attr_crate` target when
+`cargo`/`rustc` are on `PATH`):
+
+```bash
+cmake --build build --target rt_attr_crate
+# or, manually:
+cargo build --release --manifest-path rust_attr/Cargo.toml
+```
+
+Then add `rt` to your binary/library `Cargo.toml`:
+
+```toml
+[dependencies]
+rt = { path = "<path-to-rust_attr>/rt" }
+```
+
+Compile to LLVM bitcode and run the analysis pipeline:
+
+```bash
+cargo rustc --release -- --emit=llvm-bc
+BC=$(ls target/release/deps/<crate>-*.bc | head -1)
+RTEFFECT_EXTERNAL_FUNC_FILE=external_funcs.yaml opt \
+    -load-pass-plugin=build/libRTEffect.so \
+    -passes="rt-effect-infer,rt-constraint-check" \
+    -disable-output "$BC"
+```
+
+**Mechanism.** The attribute macro emits a `#[used] #[no_mangle]
+static __rt_annot_<fn>_<constraint>[_<arg>]: u8 = 0;` next to the annotated
+function, while simultaneously pushing `#[no_mangle]` + `#[inline(never)]`
+onto the function itself. `RTEffectInferPass` scans the module for globals
+matching `__rt_annot_*`, recovers `(fn_name, constraint, optional_arg)`
+triples, and installs them as LLVM function attributes (`nonblocking`,
+`nonallocating`, …, or `rt_stack_bound="<N>"` for `stack_bound`).
+`RTConstraintCheckPass` already honours these attributes, so no further
+changes are needed downstream — Rust-annotated functions are verified
+exactly like their C++ `[[rt::*]]`-annotated peers, and selective RTSan
+placement treats them identically.
+
+**Caveat.** Rust currently has no way to inject attributes into `rustc`'s
+`llvm.global.annotations` global, so a custom `__rt_annot_*` marker is
+required. The macro auto-promotes a private function with `Visibility::Inherited`
+to `pub` so `#[no_mangle]` does not trip `private_no_mangle_fns`. Existing
+explicit visibility (`pub(crate)` / `pub(super)` / `pub(in path)`) is
+preserved.
+
+**Limitations.**
+- Two `#[no_mangle] fn <same name>` markers across crates in the same link
+  will collide at link time; rename one of the functions.
+- Function names containing `_<constraint>` keyword fragments may be
+  mis-parsed; the inference pass picks the **leftmost** accepted marker
+  pattern, caveat emptor.
+- `#[rt::stack_bound(N)]` requires an integer literal; expressions
+  (`#[rt::stack_bound(MY_CONST)]`) produce a compile-time error from the
+  proc-macro itself.
 
 Set `RTEFFECT_JSON_DIAGNOSTICS` to emit one JSON object per diagnostic, or
 `RTEFFECT_SARIF_DIAGNOSTICS` to emit a single SARIF 2.1.0 run that can be
@@ -359,10 +440,15 @@ The test suite includes:
   and instrument-all modes, JSON diagnostics, metadata round-trip, Unknown
   diagnostics, unwind instrumentation, **heap-kind classification**
   (normal / stack / RT-safe / global / transitive / JSON `heap_kind`),
-  **YAML export**, and **cross-language (Rust + C++) effect propagation**
+  **YAML export**, **cross-language (Rust + C++) effect propagation**, and
+  the **Rust `#[rt::*]` annotation pathway** end-to-end through Cargo +
+  `cargo rustc --emit=llvm-bc`.
 - **Source-level tests** (`test/Inputs/*.c`): end-to-end from annotated C
   through Clang to pass pipeline, verified with FileCheck, including debug
   source-location chains
+
+Tests that require `cargo`/`rustc` are auto-skipped when the toolchain is
+absent (`bash -c 'command -v cargo >/dev/null || exit 0'`).
 
 ## Project Structure
 
@@ -387,6 +473,10 @@ rtcomp/
 ├── clang_plugin/
 │   ├── RTAttrPlugin.cpp        # [[rt::*]] attribute plugin
 │   └── CMakeLists.txt
+├── rust_attr/                  # Cargo workspace for the #[rt::*] Rust pathway
+│   ├── Cargo.toml              # workspace root
+│   ├── rt_attr/                # proc-macro crate (emits __rt_annot_* markers)
+│   └── rt/                     # facade crate re-exporting macros as #[rt::*]
 ├── rtsan_runtime/
 │   └── rtsan_shim.c            # Minimal RTSan-compatible runtime hooks
 ├── bench/                      # Hook-overhead benchmark harness
@@ -396,6 +486,8 @@ rtcomp/
 └── test/
     ├── lit.cfg                 # lit test runner configuration
     ├── cross_lang/             # Rust + C++ cross-language test inputs
-    ├── *.ll                    # IR-level FileCheck tests (heap, export, cross-lang)
+    ├── rust_attr/              # Cargo crate for lit IR-level Rust tests
+    ├── *.ll                    # IR-level FileCheck tests (heap, export, cross-lang,
+    │                           #   Rust #[rt::*] annotation pathway)
     └── Inputs/*.c              # Source-level end-to-end tests
 ```

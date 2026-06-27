@@ -1,0 +1,13 @@
+[package]
+name = "rt_attr"
+version = "0.1.0"
+edition = "2021"
+description = "Procedural macros emitting marker globals for the RTEffect Rust RT-annotation pathway."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "parsing"] }
+quote = "1"
+proc-macro2 = "1"

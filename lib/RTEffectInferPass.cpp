@@ -16,6 +16,7 @@
 #endif
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/ADT/SmallVector.h"
 #include <algorithm>
 #include <map>
 #include <queue>
@@ -64,6 +65,146 @@ bool isThrowVehicle(StringRef Name) {
   return Name == "__cxa_throw" || Name == "__cxa_rethrow" ||
          Name == "_Unwind_RaiseException" || Name == "_Unwind_Resume" ||
          Name == "longjmp" || Name == "siglongjmp";
+}
+
+// ─── Rust RT-annotation pathway ───────────────────────────────────
+//
+// The `rt_attr` proc-macro (see `rust_attr/`) emits a #[used] #[no_mangle]
+// `static __rt_annot_<fn>_<constraint>[_<arg>]: u8 = 0;` next to every
+// annotated Rust function. We recover (function, constraint, arg) triples
+// and install them as LLVM function attributes, so the existing
+// `RTConstraintCheckPass::hasConstraint`/`parseStackBound` pathway (which
+// already honours `F.hasFnAttribute(...)` and the `rt_stack_bound=<N>`
+// attribute) does the verification with zero further changes.
+//
+// Constraint keywords sorted longest-first so multi-token names such as
+// `async_signal_safe` win against shorter substrings.
+static constexpr const char *const RustAnnotConstraints[] = {
+    "async_signal_safe",
+    "nonallocating",
+    "nonblocking",
+    "norecurse",
+    "stack_bound",
+    "nothrow",
+    "nolock",
+};
+
+struct ParsedRustAnnot {
+  StringRef FnName;
+  StringRef Constraint;
+  StringRef Arg;
+};
+
+static SmallVector<ParsedRustAnnot, 16>
+collectRustAnnotations(Module &M) {
+  SmallVector<ParsedRustAnnot, 16> Out;
+  constexpr const char *Prefix = "__rt_annot_";
+  size_t PrefixLen = strlen(Prefix);
+
+  for (GlobalVariable &GV : M.globals()) {
+    StringRef N = GV.getName();
+    if (!N.starts_with(Prefix))
+      continue;
+    StringRef Rest = N.substr(PrefixLen);
+
+    // For each known constraint, try to find its keyword inside Rest such
+    // that the suffix after the keyword is:
+    //   - empty                          -> arg-less constraint
+    //   - "_<digits>"                    -> stack_bound integer arg
+    // For "<X>_<constraint>", <X> becomes the fn name. If the FN name itself
+    // contains the keyword, looking at each occurrence from left to right
+    // would still pick the first acceptable one.
+    bool Matched = false;
+    for (StringRef C : RustAnnotConstraints) {
+      std::string Needle = ("_" + C).str();
+      StringRef Sub = Rest;
+      size_t Pos = Sub.find(Needle);
+      while (Pos != StringRef::npos) {
+        StringRef After = Sub.substr(Pos + Needle.size());
+        bool Acceptable = false;
+        StringRef Arg = "";
+        if (After.empty()) {
+          Acceptable = true;
+        } else if (C == "stack_bound" && After.starts_with("_")) {
+          StringRef Tail = After.substr(1);
+          if (!Tail.empty() &&
+              Tail.find_first_not_of("0123456789") == StringRef::npos) {
+            Acceptable = true;
+            Arg = Tail;
+          }
+        }
+        if (Acceptable) {
+          Out.push_back({Rest.substr(0, Pos), C, Arg});
+          Matched = true;
+          break;
+        }
+        Sub = Sub.substr(Pos + 1);
+        Pos = Sub.find(Needle);
+      }
+      if (Matched)
+        break;
+    }
+    if (!Matched)
+      errs() << "[RTEffectInferPass] Warning: skipping unparseable Rust "
+                 "annotation marker '"
+              << N << "' (no known constraint keyword found)\n";
+  }
+  return Out;
+}
+
+static void applyRustAnnotations(Module &M) {
+  auto Annots = collectRustAnnotations(M);
+  errs() << "[RTEffectInferPass] Found " << Annots.size()
+         << " Rust RT-annotation marker(s)\n";
+  for (const ParsedRustAnnot &A : Annots) {
+    // The proc-macro auto-injects #[no_mangle], so the IR-level symbol
+    // name equals the Rust fn name. Try an exact match first; if it fails
+    // we fall back to a single-instance suffix/substring match (which is
+    // the situation when the user wrote `extern "Rust"` or otherwise has a
+    // mangled name).
+    Function *F = M.getFunction(A.FnName);
+    if (!F) {
+      Function *Ambiguous = nullptr;
+      for (Function &Cand : M.functions()) {
+        if (Cand.getName().ends_with(A.FnName) ||
+            Cand.getName().contains(A.FnName)) {
+          if (F && F != &Cand) {
+            errs() << "[RTEffectInferPass] Warning: Rust annotation for '"
+                   << A.FnName << "/" << A.Constraint << "' is ambiguous "
+                   << "between '" << F->getName() << "' and '"
+                   << Cand.getName() << "'; skipping.\n";
+            Ambiguous = (Function *)nullptr; // sentinel for "give up"
+            F = nullptr;
+            break;
+          }
+          F = &Cand;
+        }
+      }
+      if (Ambiguous == (Function *)nullptr && !F)
+        continue;
+    }
+
+    if (!F) {
+      errs() << "[RTEffectInferPass] Warning: Rust annotation for '"
+             << A.FnName << "/" << A.Constraint << "' did not match any "
+             << "IR function. Ensure the function is no_mangle.\n";
+      continue;
+    }
+
+    if (A.Constraint == "stack_bound") {
+      if (A.Arg.empty()) {
+        errs() << "[RTEffectInferPass] Warning: stack_bound annotation for '"
+               << A.FnName << "' is missing its integer arg; ignored.\n";
+        continue;
+      }
+      F->addFnAttr("rt_stack_bound", A.Arg);
+    } else {
+      F->addFnAttr(A.Constraint);
+    }
+    errs() << "[RTEffectInferPass] Applied Rust annotation '"
+           << A.Constraint << (A.Arg.empty() ? "" : "=" + A.Arg.str())
+           << "' to '" << F->getName() << "'\n";
+  }
 }
 
 std::string chainToReason(const std::vector<RTProvenanceFrame> &Chain,
@@ -334,6 +475,11 @@ PreservedAnalyses RTEffectInferPass::run(Module &M, ModuleAnalysisManager &AM) {
            << FilePath << "'. Using conservative defaults.\n";
   ExternalFuncTable ExtTable =
       ExtTableOrErr ? *ExtTableOrErr : ExternalFuncTable();
+
+  // Lift Rust rt-attribute markers into LLVM fn attributes so the existing
+  // RTConstraintCheckPass logic sees them on equal footing with the C++
+  // Clang-[[rt::*]] pathway.
+  applyRustAnnotations(M);
 
   std::vector<Function *> AddressTaken;
   collectAddressTaken(M, AddressTaken);
