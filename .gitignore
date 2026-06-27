@@ -7,3 +7,8 @@ bench/out/
 # Cargo build artefacts and per-target caches (Rust #[rt::*] pathway)
 **/target/
 **/Cargo.lock
+
+# Fetched single-header miniaudio + dr_wav (large, copyright fine to ship
+# under public domain / MIT-0 but bulky in git history; pull on demand
+# via scripts/fetch_audio_headers.sh).
+bench/audio_target/vendor/

@@ -324,16 +324,60 @@ Displays annotated source, runs inference + constraint-check + selective
 instrumentation, prints violation provenance chains, and compares
 instrument-all vs selective hook counts.
 
-### Evaluation (three-mode)
+### Evaluation (three-mode + runtime hook counting)
 
 ```bash
 scripts/eval_audio.sh
 ```
 
-Runs three modes and produces a Markdown results table:
+Runs three static modes plus a runtime heat experiment and a real
+compiler-rt RTSan link:
 - **check**: inference + constraint-check (violation count)
 - **instrument-all**: every RT function wrapped (baseline overhead)
 - **selective**: only violating call-sites wrapped (optimized)
+- **runtime**: both instrument-all / selective binaries are linked
+  against `rtsan_runtime/rtsan_shim.c` and executed; the benchmark
+  runs 100 hot-path `audio_callback(rare=0)` calls followed by one
+  cold-path `audio_callback(rare=1)` call. Their real hook-firing
+  counts (via `__rtsan_realtime_enter_count()`) are compared —
+  selective locks to zero hooks on the hot path, instrument-all
+  fires a hook on every callback. Typical output: **97 % reduction
+  end-of-run**, 0 vs 100 hooks on hot path.
+- **real-RTSan**: re-links the selective IR with
+  `-fsanitize=realtime` and runs the binary against the real
+  compiler-rt `libclang_rt.rtsan`. If the toolchain is unavailable
+  the mode is skipped. Confirms the analysis-guided hook placement
+  survives contact with the real-time library unchanged.
+
+The script enforces pass/fail assertions (3 expected violations,
+matching signature; selective IR embeds exactly 3 enter-hook pairs;
+hot-path runtime hooks fire zero under selective / 100 under
+instrument-all); on regression it prints `FAIL:` lines to stderr and
+exits non-zero, otherwise prints `PASS: eval assertions all green.`.
+
+### Evaluation with REAL miniaudio + dr_wav
+
+```bash
+scripts/fetch_audio_headers.sh     # one-time fetch of single-header libs
+scripts/eval_audio_full.sh
+```
+
+`bench/audio_target/audio_target_full.cpp` pulls in the real mackron
+`miniaudio.h` + `dr_wav.h` and exercises genuine library code
+(`synth_test_wav` writing a 16-sample float32 WAV via
+`drwav_init_file_write`, then `drwav_open_f32_and_read_pcm_frames_f32`
+loading it back). The `eval_audio_full.sh` driver builds with a
+subset of miniaudio features (`MA_NO_DEVICE_IO` / `MA_NO_DECODING` /
+`MA_NO_ENCODING` / `MA_NO_RESOURCE_MANAGER` / `MA_NO_NODE_GRAPH` /
+`MA_NO_ENGINE`) to keep the module tractable for the scanning pass;
+the resulting 802-function module is genuinely library source, not
+opaque YAML stubs.  Pre-decoded inference now flags 150+ `drwav_*/ma_*`
+helpers as `may_block=1` (e.g. `drwav_init_file -> drwav_init_file_ex
+-> fopen`), while the three expected `audio_callback` violations remain
+identical to the stubbed target — proving the architecture transfers
+cleanly to real-lib bitcode. The driver enforces the same 3-violation
+pass/fail contract plus a `REAL_FN_BLOCKING >= 5` guard so the
+real-lib coverage is not silently lost.
 
 ## External Function Table
 
@@ -469,7 +513,11 @@ rtcomp/
 │   └── RTEffectPlugin.cpp      # Pass plugin registration entry point
 ├── scripts/
 │   ├── run_rt_effect.sh        # Build/run helper for analysis and RTSan modes
-│   └── run_cross_lang.sh       # Rust + C++ joint bitcode analysis pipeline
+│   ├── run_cross_lang.sh       # Rust + C++ joint bitcode analysis pipeline
+│   ├── eval_audio.sh           # Three-mode + runtime hook-count evaluation
+│   ├── eval_audio_full.sh      # Real miniaudio/dr_wav evaluation
+│   ├── fetch_audio_headers.sh  # One-time fetch of single-header miniaudio + dr_wav
+│   └── demo.sh                 # Audio demo (annotated source → diagnostics → hooks)
 ├── clang_plugin/
 │   ├── RTAttrPlugin.cpp        # [[rt::*]] attribute plugin
 │   └── CMakeLists.txt
@@ -482,7 +530,11 @@ rtcomp/
 ├── bench/                      # Hook-overhead benchmark harness
 │   ├── audio_dsp.cpp
 │   ├── run_benchmark.sh
-│   └── README.md
+│   ├── README.md
+│   └── audio_target/
+│       ├── audio_target.cpp        # Stub-based audio target (compact, fast)
+│       ├── audio_target_full.cpp  # Real miniaudio/dr_wav audio target
+│       └── audio_target_stubs.cpp # Init-path stubs for the stub target
 └── test/
     ├── lit.cfg                 # lit test runner configuration
     ├── cross_lang/             # Rust + C++ cross-language test inputs

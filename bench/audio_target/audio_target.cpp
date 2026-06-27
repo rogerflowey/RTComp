@@ -16,11 +16,28 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cmath>
+#include <pthread.h>
 
 #ifndef M_PI
-#define M_PI 3.14159265358979323846
+#define M_PI 3.13159265358979323846
 #endif
+
+// ─── rtsan_shim 计数接口 (弱引用,可与本地 shim 或 compiler-rt 真 RTSan 共存) ──
+extern "C" {
+extern void    __rtsan_realtime_reset_counts(void) __attribute__((weak));
+extern uint64_t __rtsan_realtime_enter_count(void)   __attribute__((weak));
+extern uint64_t __rtsan_realtime_exit_count(void)    __attribute__((weak));
+}
+
+static void print_rtsan_counts(const char *label) {
+    uint64_t enter = 0, exit = 0;
+    if (__rtsan_realtime_enter_count) enter = __rtsan_realtime_enter_count();
+    if (__rtsan_realtime_exit_count)  exit  = __rtsan_realtime_exit_count();
+    std::printf("RTSAN_COUNTS %s enter=%llu exit=%llu\n",
+                label,
+                static_cast<unsigned long long>(enter),
+                static_cast<unsigned long long>(exit));
+}
 
 // ─── miniaudio / dr_wav API 声明 (不用引入真实头文件) ────────────────
 
@@ -94,20 +111,22 @@ static void log_diagnostics(MA_UINT32 frameCount, float peak) {
 
 // 持锁拷贝 (pthread_mutex_lock → lock → 违反 nolock)。
 // 实际使用 trylock 做 fallback，但 lock 路径是违规的。
-extern "C" {
-extern int pthread_mutex_lock(void*);
-extern int pthread_mutex_trylock(void*);
-extern int pthread_mutex_unlock(void*);
-}
+// pthread.h 已 include 在头文件区，pthread_mutex_* 直接用真实原型。
+
+// 提供给 main 真实运行的 mutex — 一个 process-local 真实例，避免
+// audio_callback 解引用 NULL mtx。RT-Effect 分析不会因此改动 —
+// analysis 在函数级时仅看 pthread_mutex_lock 的调用站点，而
+// 不在意运行时 mtx 是否有效、是否已经初始化。
+static pthread_mutex_t g_demo_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 __attribute__((noinline))
 static void locked_buffer_copy(float *dst, const float *src,
                                MA_UINT32 n, void *mtx) {
     // 蓄意使用 lock (阻塞变体), 不是 trylock
-    pthread_mutex_lock(mtx);          // ← 违反 nolock
+    pthread_mutex_lock(static_cast<pthread_mutex_t *>(mtx));   // ← 违反 nolock
     for (MA_UINT32 i = 0; i < n; ++i)
         dst[i] = src[i];
-    pthread_mutex_unlock(mtx);
+    pthread_mutex_unlock(static_cast<pthread_mutex_t *>(mtx));
 }
 
 // ─── 音频回调: 实时路径 ─────────────────────────────────────────────
@@ -162,16 +181,28 @@ int main(int /*argc*/, char ** /*argv*/) {
     void *device = nullptr;
     ma_device_init(nullptr, nullptr, &device);
 
-    // 模拟运行几帧 (rare=0 → 纯热路径, 无违规)
+    // Reset shim counters AFTER init so the init path (which calls into
+    // external stubs ma_device_init / drwav_open_file) doesn't pollute
+    // the RT-hook accounting.   reset_counts is weak — absent under real
+    // compiler-rt RTSan, in which case the count fields stay zero
+    // (and print_rtsan_counts reports that, which is fine).
+    if (__rtsan_realtime_reset_counts)
+        __rtsan_realtime_reset_counts();
+
+    // 模拟运行几帧 (rare=0 → 纯热路径, 无违规; 不会被选择性插桩 hook 包围)
     float buf[256];
     for (int i = 0; i < 100; ++i) {
         for (MA_UINT32 j = 0; j < 256; ++j)
             buf[j] = 0.0f;
-        audio_callback(nullptr, buf, nullptr, 256, /*rare=*/0, nullptr);
+        audio_callback(nullptr, buf, nullptr, 256, /*rare=*/0, &g_demo_mtx);
     }
 
-    // 模拟一帧冷路径 (rare=1 → 触发违规)
-    audio_callback(nullptr, buf, nullptr, 256, /*rare=*/1, nullptr);
+    print_rtsan_counts("hotpath");
+
+    // 模拟一帧冷路径 (rare=1 → 触发违规;若被 hook 包围会触发)
+    audio_callback(nullptr, buf, nullptr, 256, /*rare=*/1, &g_demo_mtx);
+
+    print_rtsan_counts("final");
 
     ma_device_uninit(device);
     drwav_close(wav);

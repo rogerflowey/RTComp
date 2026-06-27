@@ -500,8 +500,14 @@ PreservedAnalyses RTEffectInferPass::run(Module &M, ModuleAnalysisManager &AM) {
   std::map<Function *, std::vector<ResolvedPolyEdge>> PolyOutEdges;
 
   // keep track of witness instructions per (function, kind) so
-  // RTSanPlacementPass can find them later.
-  std::map<Function *, std::vector<std::pair<Instruction *, int>>>
+  // RTSanPlacementPass can find them later. Multiple callees can contribute
+  // the same effect to one caller (e.g. one function calls two different
+  // blocking helpers); both call sites must be tagged so that per-call-site
+  // selective instrumentation wraps *every* contributing site rather than
+  // only the one whose chain happens to be first in the provenance stack.
+  // Using a std::set dedups (CallBase*, Kind) pairs across worklist
+  // iterations even when the callee's summary is re-merged.
+  std::map<Function *, std::set<std::pair<Instruction *, int>>>
       DirectWitnesses;
 
   for (auto &F : M) {
@@ -555,7 +561,7 @@ PreservedAnalyses RTEffectInferPass::run(Module &M, ModuleAnalysisManager &AM) {
             setEffect(Summary, RTE_Throw, F, I,
                       Callee ? Callee->getName() : "<indirect>",
                       "invoke");
-            DirectWitnesses[&F].push_back({&I, RTE_Throw});
+            DirectWitnesses[&F].insert({&I, RTE_Throw});
           }
         }
 
@@ -579,7 +585,7 @@ PreservedAnalyses RTEffectInferPass::run(Module &M, ModuleAnalysisManager &AM) {
           setEffect(Summary, RTE_Unknown, F, I, "<indirect call>",
                     "indirect-call");
           HasNonPolyUnknown = true;
-          DirectWitnesses[&F].push_back({&I, RTE_Unknown});
+          DirectWitnesses[&F].insert({&I, RTE_Unknown});
           continue;
         }
 
@@ -619,7 +625,7 @@ PreservedAnalyses RTEffectInferPass::run(Module &M, ModuleAnalysisManager &AM) {
             Witnesses.push_back(RTE_SignalUnsafe);
           }
           for (int K : Witnesses)
-            DirectWitnesses[&F].push_back({&I, K});
+            DirectWitnesses[&F].insert({&I, K});
           continue;
         }
 
@@ -627,12 +633,12 @@ PreservedAnalyses RTEffectInferPass::run(Module &M, ModuleAnalysisManager &AM) {
           // Unknown external. May still be a known throw vehicle.
           if (isThrowVehicle(CalleeName)) {
             setEffect(Summary, RTE_Throw, F, I, CalleeName, "external");
-            DirectWitnesses[&F].push_back({&I, RTE_Throw});
+            DirectWitnesses[&F].insert({&I, RTE_Throw});
           } else {
             setEffect(Summary, RTE_Unknown, F, I, CalleeName,
                       "unknown-external");
             HasNonPolyUnknown = true;
-            DirectWitnesses[&F].push_back({&I, RTE_Unknown});
+            DirectWitnesses[&F].insert({&I, RTE_Unknown});
           }
           continue;
         }
@@ -655,7 +661,7 @@ PreservedAnalyses RTEffectInferPass::run(Module &M, ModuleAnalysisManager &AM) {
       for (const PolySite &PS : Sites) {
         setEffect(Summary, RTE_Unknown, F, *PS.CB,
                   "<argument-forward call>", "indirect-call");
-        DirectWitnesses[&F].push_back({PS.CB, RTE_Unknown});
+        DirectWitnesses[&F].insert({PS.CB, RTE_Unknown});
       }
     }
   }
@@ -805,14 +811,36 @@ PreservedAnalyses RTEffectInferPass::run(Module &M, ModuleAnalysisManager &AM) {
             continue;
 
           for (int K = 0; K < RTE_Count; ++K) {
-            if (*It->second.flagPtr(K) && !*NewSummary.flagPtr(K)) {
-              mergeChainPrepended(NewSummary, K, *F, *CB, *Callee,
-                                  *It->second.chainPtr(K));
+            // Always tag this call site as a witness for each effect that
+            // the callee propagates, even if the caller already has the
+            // effect set (e.g. via a different sibling callee). The
+            // dedup semantics of std::set keep repeated worklist passes
+            // from inflating the list. Restricting chain-merge to the
+            // first contributor preserves a single provenance chain for
+            // diagnostics — the multi-witness information lives in the
+            // metadata tag below so per-callsite instrumentation wraps
+            // every contributing call site.
+            if (*It->second.flagPtr(K)) {
+              DirectWitnesses[F].insert({CB, K});
+              if (!*NewSummary.flagPtr(K)) {
+                mergeChainPrepended(NewSummary, K, *F, *CB, *Callee,
+                                    *It->second.chainPtr(K));
+              }
             }
           }
-          if (It->second.MayAllocHeapKind > NewSummary.MayAllocHeapKind) {
-            prependHeapChain(NewSummary, It->second.MayAllocHeapKind,
-                             *F, *CB, *Callee, It->second.AllocHeapChain);
+          if (It->second.MayAllocHeapKind != HK_None) {
+            // Only RT-unsafe (NormalHeap) callees warrant a per-callsite
+            // alloc witness for selective instrumentation. Stack, Global
+            // and RTHeap are real-time-safe; tagging them would force
+            // per-call-site hooks around helpers that merely hold a stack
+            // loop slot, which inflates hook counts without telling us
+            // anything about RT safety.
+            if (It->second.MayAllocHeapKind == HK_NormalHeap)
+              DirectWitnesses[F].insert({CB, RTE_Alloc});
+            if (It->second.MayAllocHeapKind > NewSummary.MayAllocHeapKind) {
+              prependHeapChain(NewSummary, It->second.MayAllocHeapKind,
+                               *F, *CB, *Callee, It->second.AllocHeapChain);
+            }
           }
         }
       }
@@ -1033,42 +1061,19 @@ PreservedAnalyses RTEffectInferPass::run(Module &M, ModuleAnalysisManager &AM) {
       Pair.second.MaxStackDepth = -1;
   }
 
-  // Materialize witness metadata on instructions.
+  // Materialize witness metadata on instructions. As of the multi-witness
+  // fix, DirectWitnesses already covers BOTH the direct effect sources
+  // (external functions recognised during the first scan) AND the
+  // internal-transitive contributors (callees whose own summaries
+  // contributed an effect to this caller during the worklist fixpoint).
+  // Per-call-site instrumentation wraps every contributor, not just the
+  // first callee whose chain happened to win the setEffect race.
   for (auto &Pair : DirectWitnesses) {
     std::map<Instruction *, std::vector<int>> Grouped;
     for (auto &W : Pair.second)
       Grouped[W.first].push_back(W.second);
     for (auto &Entry : Grouped)
       appendWitnessMetadata(*Entry.first, Entry.second);
-  }
-
-  // Transitive witnesses: for any function with a flagged effect whose
-  // chain points at an internal callee, mark the call instruction(s) in
-  // the caller as witnesses so per-callsite instrumentation can wrap
-  // exactly that site instead of the whole function.
-  for (auto &Pair : FuncSummaries) {
-    Function *F = Pair.first;
-    FunctionEffectSummary &S = Pair.second;
-    for (int K = 0; K < RTE_Count; ++K) {
-      if (!*S.flagPtr(K))
-        continue;
-      const auto &Chain = *S.chainPtr(K);
-      if (Chain.empty())
-        continue;
-      StringRef CalleeName = Chain.front().CalleeName;
-      if (CalleeName.empty() || CalleeName.starts_with("<"))
-        continue;
-      for (auto &BB : *F) {
-        for (auto &I : BB) {
-          auto *CB = dyn_cast<CallBase>(&I);
-          if (!CB || CB->isIndirectCall())
-            continue;
-          Function *Cal = CB->getCalledFunction();
-          if (Cal && Cal->getName() == CalleeName)
-            appendWitnessMetadata(*CB, {K});
-        }
-      }
-    }
   }
 
   // Write summaries + emit a textual log line per function.
