@@ -94,6 +94,8 @@ static void log_diagnostics(ma_uint32 frameCount, float peak) {
 }
 
 static pthread_mutex_t g_demo_mtx = PTHREAD_MUTEX_INITIALIZER;
+static ma_gainer g_demo_gainer;
+static bool g_demo_gainer_ready = false;
 
 __attribute__((noinline))
 static void locked_buffer_copy(float *dst, const float *src,
@@ -115,6 +117,8 @@ void audio_callback(void * /*pDevice*/, void *pOutput,
     static float lp_state = 0.0f;
     float *out = (float *)pOutput;
 
+    if (g_demo_gainer_ready)
+        ma_gainer_process_pcm_frames(&g_demo_gainer, out, out, frameCount);
     apply_gain(out, frameCount, 0.85f);
     lowpass_filter(out, frameCount, &lp_state, 0.15f);
     clamp(out, frameCount, -1.0f, 1.0f);
@@ -153,9 +157,42 @@ static void synth_test_wav(const char *path) {
     drwav_uninit(&wav);
 }
 
+__attribute__((noinline)) __attribute__((used))
+static void exercise_miniaudio_init_path() {
+    float samples[32];
+    for (int i = 0; i < 32; ++i)
+        samples[i] = static_cast<float>(i) / 32.0f;
+
+    ma_audio_buffer_config buffer_config =
+        ma_audio_buffer_config_init(ma_format_f32, 1, 32, samples, nullptr);
+
+    ma_audio_buffer *buffer = nullptr;
+    if (ma_audio_buffer_alloc_and_init(&buffer_config, &buffer) != MA_SUCCESS) {
+        std::fprintf(stderr, "ma_audio_buffer_alloc_and_init failed\n");
+        return;
+    }
+
+    float out[16] = {};
+    ma_audio_buffer_read_pcm_frames(buffer, out, 16, false);
+    std::printf("[full] miniaudio buffer sample %.3f\n", out[0]);
+    ma_audio_buffer_uninit_and_free(buffer);
+}
+
+static void init_miniaudio_realtime_dsp() {
+    ma_gainer_config gainer_config = ma_gainer_config_init(1, 16);
+    if (ma_gainer_init(&gainer_config, nullptr, &g_demo_gainer) != MA_SUCCESS) {
+        std::fprintf(stderr, "ma_gainer_init failed\n");
+        return;
+    }
+    ma_gainer_set_master_volume(&g_demo_gainer, 0.95f);
+    g_demo_gainer_ready = true;
+}
+
 int main(int /*argc*/, char ** /*argv*/) {
     const char *wav_path = "/tmp/rteffect_audio_full.wav";
     synth_test_wav(wav_path);
+    exercise_miniaudio_init_path();
+    init_miniaudio_realtime_dsp();
 
     // Real WAV loading via dr_wav. Shows that analysis can attribute
     // effects to library-internal code (drwav_open_file opens FILE,
@@ -184,6 +221,9 @@ int main(int /*argc*/, char ** /*argv*/) {
 
     audio_callback(nullptr, buf, nullptr, 256, /*rare=*/1, &g_demo_mtx);
     print_rtsan_counts("final");
+
+    if (g_demo_gainer_ready)
+        ma_gainer_uninit(&g_demo_gainer, nullptr);
 
     return 0;
 }

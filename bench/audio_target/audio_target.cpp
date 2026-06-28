@@ -22,6 +22,18 @@
 #define M_PI 3.13159265358979323846
 #endif
 
+#ifndef RT_BENCH_HOT_ITERS
+#define RT_BENCH_HOT_ITERS 100
+#endif
+
+#ifndef RT_BENCH_FRAMES
+#define RT_BENCH_FRAMES 256
+#endif
+
+#ifndef RT_BENCH_DSP_PASSES
+#define RT_BENCH_DSP_PASSES 1
+#endif
+
 // ─── rtsan_shim 计数接口 (弱引用,可与本地 shim 或 compiler-rt 真 RTSan 共存) ──
 extern "C" {
 extern void    __rtsan_realtime_reset_counts(void) __attribute__((weak));
@@ -148,9 +160,11 @@ void audio_callback(void * /*pDevice*/, void *pOutput,
     float *out = (float *)pOutput;
 
     // 热路径: 纯 DSP, 无违规
-    apply_gain(out, frameCount, 0.85f);
-    lowpass_filter(out, frameCount, &lp_state, 0.15f);
-    clamp(out, frameCount, -1.0f, 1.0f);
+    for (int pass = 0; pass < RT_BENCH_DSP_PASSES; ++pass) {
+        apply_gain(out, frameCount, 0.85f);
+        lowpass_filter(out, frameCount, &lp_state, 0.15f);
+        clamp(out, frameCount, -1.0f, 1.0f);
+    }
 
     // 冷路径: 蓄意违规 — 只在 rare 时触发
     if (rare) {
@@ -190,17 +204,17 @@ int main(int /*argc*/, char ** /*argv*/) {
         __rtsan_realtime_reset_counts();
 
     // 模拟运行几帧 (rare=0 → 纯热路径, 无违规; 不会被选择性插桩 hook 包围)
-    float buf[256];
-    for (int i = 0; i < 100; ++i) {
-        for (MA_UINT32 j = 0; j < 256; ++j)
+    float buf[RT_BENCH_FRAMES];
+    for (int i = 0; i < RT_BENCH_HOT_ITERS; ++i) {
+        for (MA_UINT32 j = 0; j < RT_BENCH_FRAMES; ++j)
             buf[j] = 0.0f;
-        audio_callback(nullptr, buf, nullptr, 256, /*rare=*/0, &g_demo_mtx);
+        audio_callback(nullptr, buf, nullptr, RT_BENCH_FRAMES, /*rare=*/0, &g_demo_mtx);
     }
 
     print_rtsan_counts("hotpath");
 
     // 模拟一帧冷路径 (rare=1 → 触发违规;若被 hook 包围会触发)
-    audio_callback(nullptr, buf, nullptr, 256, /*rare=*/1, &g_demo_mtx);
+    audio_callback(nullptr, buf, nullptr, RT_BENCH_FRAMES, /*rare=*/1, &g_demo_mtx);
 
     print_rtsan_counts("final");
 

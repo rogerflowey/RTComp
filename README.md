@@ -355,6 +355,70 @@ hot-path runtime hooks fire zero under selective / 100 under
 instrument-all); on regression it prints `FAIL:` lines to stderr and
 exits non-zero, otherwise prints `PASS: eval assertions all green.`.
 
+### Wall-time benchmark
+
+```bash
+HOT_ITERS=3000000 ROUNDS=11 scripts/bench_wall_time.sh
+HOT_ITERS=5000000 ROUNDS=9  scripts/bench_wall_time.sh
+RT_BENCH_FRAMES=128 RT_BENCH_DSP_PASSES=4 \
+  HOT_ITERS=1000000 ROUNDS=5 scripts/bench_wall_time.sh
+```
+
+This driver scales the hot callback loop, builds `baseline`,
+`instrument_all`, and `selective` binaries from the same bitcode, warms
+each binary once, then reports repeated `perf_counter()` wall time plus
+the final RTSan hook counts. On the current LLVM 22.1.6 / x86_64 Linux
+test host, two representative runs were:
+
+| Hot iters | Rounds | Mode | Median time | Final enter hooks |
+|-----------|--------|------|-------------|-------------------|
+| 3,000,000 | 11 | baseline | 1.688888 s | 0 |
+| 3,000,000 | 11 | instrument-all | 1.755331 s | 3,000,001 |
+| 3,000,000 | 11 | selective | 1.714089 s | 3 |
+| 5,000,000 | 9 | baseline | 2.747493 s | 0 |
+| 5,000,000 | 9 | instrument-all | 2.883601 s | 5,000,001 |
+| 5,000,000 | 9 | selective | 2.843405 s | 3 |
+
+The measured median wall-time reduction of selective versus
+instrument-all was **2.35%** at 3,000,000 hot callbacks and **1.39%** at
+5,000,000 hot callbacks. The corresponding dynamic RTSan enter-hook
+counts dropped from one hook per callback invocation to the three cold
+witness sites. This shows a real but small wall-time gain for this CPU
+DSP target; the hook-count reduction is much larger than the elapsed-time
+reduction because the local shim hook body is intentionally minimal and
+the DSP loop still dominates total runtime.
+
+For broader coverage, `scripts/bench_audio_matrix.sh` sweeps common
+audio buffer sizes and DSP loads:
+
+```bash
+HOT_ITERS=1000000 ROUNDS=5 \
+  FRAMES_LIST="64 128 256 512" DSP_PASSES_LIST="1 4" \
+  scripts/bench_audio_matrix.sh
+```
+
+Representative matrix results on the same host:
+
+| Frames | DSP passes | Baseline median | Instrument-all median | Selective median | Selective vs all | All enter hooks | Selective enter hooks |
+|--------|------------|-----------------|-----------------------|------------------|------------------|-----------------|-----------------------|
+| 64 | 1 | 0.138695 s | 0.136722 s | 0.135664 s | 0.77% faster | 1,000,001 | 3 |
+| 64 | 4 | 0.543053 s | 0.544224 s | 0.532113 s | 2.23% faster | 1,000,001 | 3 |
+| 128 | 1 | 0.283086 s | 0.279611 s | 0.278246 s | 0.49% faster | 1,000,001 | 3 |
+| 128 | 4 | 1.071791 s | 1.069517 s | 1.098845 s | 2.74% slower | 1,000,001 | 3 |
+| 256 | 1 | 0.559588 s | 0.562540 s | 0.552458 s | 1.79% faster | 1,000,001 | 3 |
+| 256 | 4 | 2.170672 s | 2.187521 s | 2.195934 s | 0.38% slower | 1,000,001 | 3 |
+| 512 | 1 | 1.136765 s | 1.123536 s | 1.119483 s | 0.36% faster | 1,000,001 | 3 |
+| 512 | 4 | 4.397796 s | 4.460877 s | 4.550358 s | 2.01% slower | 1,000,001 | 3 |
+
+Across the matrix, selective consistently removes hot-path RTSan hook
+execution (1,000,001 enter hooks down to 3, a 99.9997% dynamic-hook
+reduction). Wall-clock changes are low-single-digit and sometimes fall on
+either side of zero because the counting shim hook is tiny, the DSP loop
+dominates total runtime, and process-level timing noise is comparable to
+the saved hook-call cost. The robust claim is therefore dynamic hook
+elimination and improved real-time headroom; elapsed-time gains are
+workload- and runtime-dependent.
+
 ### Evaluation with REAL miniaudio + dr_wav
 
 ```bash

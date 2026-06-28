@@ -54,6 +54,7 @@ done
 SRC_BC="$OUT_DIR/audio_target_full.bc"
 SHIM_O="$OUT_DIR/rtsan_shim.o"
 CHECK_LOG="$OUT_DIR/check.log"
+DIS_LL="$OUT_DIR/audio_target_full.dis.ll"
 
 # ── build ──────────────────────────────────────────────────────────
 echo "[full] compiling shim..."
@@ -71,7 +72,8 @@ MA_DEFS=(
 "$CLANGXX" -std=c++17 -O1 -g -emit-llvm -c -I"$ROOT/bench/audio_target" \
   "${MA_DEFS[@]}" "$TARGET" -o "$SRC_BC"
 
-FUNC_COUNT=$(llvm-dis "$SRC_BC" -o - 2>/dev/null | grep -c '^define')
+llvm-dis "$SRC_BC" -o "$DIS_LL"
+FUNC_COUNT=$(grep -c '^define' "$DIS_LL")
 echo "[full] module contains $FUNC_COUNT functions"
 
 # ── analysis ──────────────────────────────────────────────────────
@@ -91,7 +93,11 @@ SAFE_COUNT=$(grep -c '^\[RT-FEA\] SAFE' "$CHECK_LOG" || true)
 # of them being reported as SAFE under no constraint (none, since
 # they are not rt-annotated).
 REAL_FN_BLOCKING=$(rg -c '^  (drwav|ma)_.*: may_block=1' "$CHECK_LOG" || true)
-REAL_FN_ALLOC=$(rg -c '^  (drwav|ma)_.*: may_alloc=1' "$CHECK_LOG" || true)
+REAL_FN_ALLOC=$(rg -c '^  (drwav|ma)_.*: .*may_alloc=1' "$CHECK_LOG" || true)
+MINIAUDIO_IR_CALLS=$(rg 'call .*@ma_audio_buffer_(alloc_and_init|read_pcm_frames|uninit_and_free)' "$DIS_LL" || true)
+MINIAUDIO_HIGHLIGHTS=$(grep -E '^  ma_audio_buffer_(alloc_and_init|uninit_and_free):|^  _ZL28exercise_miniaudio_init_pathv:' "$CHECK_LOG" || true)
+MINIAUDIO_DSP_IR_CALLS=$(rg 'call .*@ma_gainer_process_pcm_frames' "$DIS_LL" || true)
+MINIAUDIO_DSP_HIGHLIGHTS=$(grep -E '^  ma_gainer_(init|uninit|process_pcm_frames):|^  audio_callback: .*ma_gainer_process_pcm_frames' "$CHECK_LOG" || true)
 
 cat <<TABLE
 
@@ -100,8 +106,8 @@ cat <<TABLE
 | Metric                            | Value                              |
 |-----------------------------------|------------------------------------|
 | Module functions (post -O1)       | ${FUNC_COUNT}                       |
-| Real `(drwav\|ma)_*` fns flagged may_block | ${REAL_FN_BLOCKING}             |
-| Real `(drwav\|ma)_*` fns flagged may_alloc | ${REAL_FN_ALLOC}             |
+| Real drwav/ma fns flagged may_block | ${REAL_FN_BLOCKING}             |
+| Real drwav/ma fns flagged may_alloc | ${REAL_FN_ALLOC}             |
 | Violations detected in audio_callback | ${VIOL_COUNT}                  |
 | ProvenSafe functions (rt-annotated only) | ${SAFE_COUNT}               |
 
@@ -111,10 +117,24 @@ cat <<TABLE
 $(grep '^\[RT-FEA\].*violation in' "$CHECK_LOG" || echo "(none)")
 \`\`\`
 
-### Real-lib inference highlights (top 5 `drwav_init*` summaries)
+### Real-lib inference highlights (top 5 drwav_init summaries)
 
 \`\`\`
-$(grep -E '^  drwav_init.*may_block=1|^  drwav_init.*may_alloc=1' "$CHECK_LOG" | head -5)
+$(rg -m 5 '^  drwav_init.*may_block=1|^  drwav_init.*may_alloc=1' "$CHECK_LOG" || true)
+\`\`\`
+
+### Actual miniaudio init-path call chain
+
+\`\`\`
+${MINIAUDIO_HIGHLIGHTS:-(none)}
+${MINIAUDIO_IR_CALLS:-(IR did not include direct miniaudio calls)}
+\`\`\`
+
+### Actual miniaudio realtime DSP call
+
+\`\`\`
+${MINIAUDIO_DSP_HIGHLIGHTS:-(none)}
+${MINIAUDIO_DSP_IR_CALLS:-(IR did not include ma_gainer_process_pcm_frames)}
 \`\`\`
 
 Tight-set inspection log: \`$CHECK_LOG\`
@@ -139,6 +159,22 @@ if [[ "$VIOL_COUNT" -ne 3 ]]; then
 fi
 if [[ "${REAL_FN_BLOCKING:-0}" -lt 5 ]]; then
   echo "FAIL: REAL_FN_BLOCKING=${REAL_FN_BLOCKING:-0}, expected 5+ real-lib functions flagged blocking." >&2
+  PASS=false
+fi
+if ! rg -q '@ma_audio_buffer_alloc_and_init' "$DIS_LL"; then
+  echo "FAIL: full target IR did not call ma_audio_buffer_alloc_and_init." >&2
+  PASS=false
+fi
+if ! rg -q '^  ma_audio_buffer_alloc_and_init: may_block=1 may_alloc=1' "$CHECK_LOG"; then
+  echo "FAIL: miniaudio allocation API was not inferred as may_block/may_alloc." >&2
+  PASS=false
+fi
+if ! rg -q '@ma_gainer_process_pcm_frames' "$DIS_LL"; then
+  echo "FAIL: full target IR did not call ma_gainer_process_pcm_frames." >&2
+  PASS=false
+fi
+if ! rg -q '^  ma_gainer_process_pcm_frames: may_block=0 may_alloc=0 .*unknown=0' "$CHECK_LOG"; then
+  echo "FAIL: miniaudio realtime DSP API was not inferred as safe." >&2
   PASS=false
 fi
 if [[ "$PASS" != "true" ]]; then
